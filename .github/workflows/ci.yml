@@ -165,7 +165,10 @@ jobs:
         with:
           python-version: "3.13"
       - name: Sync
-        run: uv sync --frozen --package nooa --no-dev --group test
+        # nooa-cli is needed: the memory-baseline test drives a CodingAgent,
+        # and the worker mirrors every imported workspace package into the
+        # runtime root, so the package has to be installed here as well.
+        run: uv sync --frozen --package nooa --package nooa-cli --no-dev --group test --extra cli
       - name: Cache the private runtime root
         uses: actions/cache@v4
         with:
