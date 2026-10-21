@@ -51,10 +51,15 @@ def _is_app_execution_alias(path: str | Path) -> bool:
 def _resolve_powershell() -> str | None:
     """Pick a PowerShell that a job object can actually contain.
 
-    Preference: an MSI-installed ``pwsh``, then ``powershell.exe`` (always a
-    plain executable), then the Store alias only if nothing else exists — a
-    session that cannot reap its children is worse than no PowerShell 7, but
-    better than failing to start at all.
+    Order: whatever PATH resolves for ``pwsh``, then ``powershell.exe``, then a
+    known MSI install path. The first two are what the caller asked for — an
+    explicit ``powershell.exe`` on PATH means Windows PowerShell 5.1, and
+    overriding that with an installed PowerShell 7 would ignore the choice.
+    The MSI path is a fallback for the case PATH cannot serve: a Store alias
+    cannot be contained by a job object, because it launches the packaged app
+    through its own process-creation path and the job does not contain what it
+    starts — measured: the host was in the job, its child and grandchild were
+    not, and both survived ``close()``.
 
     ``shutil.which`` searches the current directory before PATH on Windows
     unless ``NoDefaultCurrentDirectoryInExePath`` is set, so a repository can
@@ -66,15 +71,16 @@ def _resolve_powershell() -> str | None:
         found = shutil.which(name)
         if found and os.path.isabs(found):
             candidates.append(found)
-    # A known MSI install path beats a Store alias even when the alias wins PATH.
-    msi = (
-        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "PowerShell" / "7" / "pwsh.exe"
-    )
-    if msi.exists():
-        candidates.insert(0, str(msi))
     for candidate in candidates:
         if not _is_app_execution_alias(candidate):
             return candidate
+    # PATH offered nothing containable. An MSI install is still better than a
+    # Store alias, and both are better than no PowerShell at all.
+    msi = (
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "PowerShell" / "7" / "pwsh.exe"
+    )
+    if msi.exists() and not _is_app_execution_alias(msi):
+        return str(msi)
     return candidates[0] if candidates else None
 
 

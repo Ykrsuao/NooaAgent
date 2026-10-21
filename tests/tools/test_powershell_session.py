@@ -697,6 +697,49 @@ def test_resolver_prefers_a_containable_powershell_over_the_store_alias(monkeypa
     assert _powershell_session._resolve_powershell() == str(plain)
 
 
+def test_resolver_honours_powershell_on_path_over_an_installed_pwsh(monkeypatch, tmp_path):
+    """An explicit ``powershell.exe`` on PATH means Windows PowerShell 5.1.
+
+    The resolver used to insert a known MSI install at the front unconditionally,
+    so a caller who put ``powershell.exe`` first still got PowerShell 7 — the
+    acceptance tests set up exactly that and then asserted the version they had
+    asked for. The MSI path is a fallback for when PATH cannot serve, not an
+    override.
+    """
+    from nooa.tools import _powershell_session
+
+    win_ps = tmp_path / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    msi = tmp_path / "program-files" / "PowerShell" / "7" / "pwsh.exe"
+    win_ps.parent.mkdir(parents=True)
+    msi.parent.mkdir(parents=True)
+    win_ps.write_text("", encoding="utf-8")
+    msi.write_text("", encoding="utf-8")
+
+    # pwsh is absent from PATH; powershell.exe is there and is not an alias.
+    monkeypatch.setattr(
+        _powershell_session.shutil,
+        "which",
+        lambda name: str(win_ps) if name == "powershell" else None,
+    )
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "program-files"))
+    assert _powershell_session._resolve_powershell() == str(win_ps), (
+        "an installed pwsh overrode the powershell.exe the caller put on PATH"
+    )
+
+
+def test_resolver_falls_back_to_an_installed_pwsh_when_path_has_nothing(monkeypatch, tmp_path):
+    """With an empty PATH the MSI install is still usable."""
+    from nooa.tools import _powershell_session
+
+    msi = tmp_path / "program-files" / "PowerShell" / "7" / "pwsh.exe"
+    msi.parent.mkdir(parents=True)
+    msi.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(_powershell_session.shutil, "which", lambda name: None)
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "program-files"))
+    assert _powershell_session._resolve_powershell() == str(msi)
+
+
 def test_resolver_discards_a_relative_which_hit(monkeypatch):
     """``shutil.which`` searches the current directory on Windows.
 
