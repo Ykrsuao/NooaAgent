@@ -66,9 +66,7 @@ _START_METHOD = "spawn" if os.name == "nt" else "fork"
 def _sandbox_config() -> SandboxConfig:
     # require=False so a CI host without a guard mechanism still runs the cell;
     # network on so the worker's own imports behave like the in-process ones.
-    return SandboxConfig(
-        require=False, network=True, filesystem=False, start_method=_START_METHOD
-    )
+    return SandboxConfig(require=False, network=True, filesystem=False, start_method=_START_METHOD)
 
 
 @pytest.fixture
@@ -96,9 +94,7 @@ async def test_sandbox_matches_inprocess(name: str, code: str, expected: str, ex
 
     sandbox = await executor.run_cell(code, execution_count=1)
     assert sandbox.error is None, f"sandbox errored: {sandbox.error}"
-    assert repr(sandbox.returned_value) == expected, (
-        f"{name}: sandbox and in-process disagree"
-    )
+    assert repr(sandbox.returned_value) == expected, f"{name}: sandbox and in-process disagree"
     assert sandbox.explicit_return == inprocess.explicit_return
     assert sandbox.stdout == inprocess.stdout
 

@@ -302,7 +302,14 @@ class TestOffsetClearing:
 
     @pytest.mark.asyncio
     async def test_offset_matches_actual_wrapper_structure(self, test_agent):
-        """wrapper_line_offset should match the actual number of header lines."""
+        """wrapper_line_offset should match the actual number of header lines.
+
+        A ``global`` line is emitted only for names the cell *assigns*: reading a
+        session variable from the surrounding namespace needs no declaration.
+        So ``y = x + 1`` (reads ``x``, binds ``y``) has a two-line header, while
+        ``x = x + 1`` (rebinds ``x``) grows it to three. What must hold in both
+        cases is that the reported offset equals the header actually emitted.
+        """
         # First execution - no globals, offset should be 2
         code1 = "x = 1"
         result1 = await test_agent.runtime.execute_code(
@@ -312,13 +319,25 @@ class TestOffsetClearing:
             f"Expected offset 2 with no globals, got {result1.wrapper_line_offset}"
         )
 
-        # Second execution - 1 global, offset should be 3
+        # Reading a session variable binds nothing it must declare: offset stays 2.
         code2 = "y = x + 1"
         result2 = await test_agent.runtime.execute_code(
             code2, execution_count=2, wrap_in_function=True, builtins=result1.captured_locals
         )
-        assert result2.wrapper_line_offset == 3, (
-            f"Expected offset 3 with globals, got {result2.wrapper_line_offset}"
+        assert result2.error is None, f"read-only use of a session variable failed: {result2.error}"
+        assert result2.wrapper_line_offset == 2, (
+            f"Expected offset 2 for a cell that declares nothing, got "
+            f"{result2.wrapper_line_offset}"
+        )
+
+        # Rebinding a session variable needs the declaration: offset becomes 3.
+        code3 = "x = x + 1"
+        result3 = await test_agent.runtime.execute_code(
+            code3, execution_count=3, wrap_in_function=True, builtins=result1.captured_locals
+        )
+        assert result3.error is None, f"rebinding a session variable failed: {result3.error}"
+        assert result3.wrapper_line_offset == 3, (
+            f"Expected offset 3 with globals, got {result3.wrapper_line_offset}"
         )
 
     @pytest.mark.asyncio

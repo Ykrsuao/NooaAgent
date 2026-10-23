@@ -54,7 +54,12 @@ CORPUS: list[tuple[str, str, str, list[str]]] = [
     ("multiline_fstring", 'name = "x"\nf"""\n{name}\n"""', "'\\nx\\n'", []),
     ("helper_def", "def helper(n):\n    return n * 2\nhelper(3)", "6", []),
     ("helper_def_explicit", "def helper(n):\n    return n * 2\nreturn helper(3)", "6", []),
-    ("nested_def", "def outer():\n    def inner():\n        return 5\n    return inner()\nouter()", "5", []),
+    (
+        "nested_def",
+        "def outer():\n    def inner():\n        return 5\n    return inner()\nouter()",
+        "5",
+        [],
+    ),
     ("self_call", "self.record('a')", "'recorded:a'", ["a"]),
     ("self_call_twice", "self.record('a'); self.record('b')", "'recorded:b'", ["a", "b"]),
     ("list_comp", "[i * 2 for i in range(3)]", "[0, 2, 4]", []),
@@ -118,9 +123,7 @@ async def test_error_line_numbers_point_at_the_user_source() -> None:
     sandbox = await run_cell_source(code, {"self": _RecorderAgent()}, execution_count=1)
 
     for result in (inprocess, sandbox):
-        rendered = format_error_for_llm(
-            result.error, code, line_offset=result.wrapper_line_offset
-        )
+        rendered = format_error_for_llm(result.error, code, line_offset=result.wrapper_line_offset)
         assert "line 2" in rendered, rendered
         assert "line 1" not in rendered, rendered
 

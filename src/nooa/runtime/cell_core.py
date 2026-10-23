@@ -272,9 +272,7 @@ class PreparedCell:
                     cast(Any, fn)._generated_source = source
 
         defined_methods = {
-            name: namespace[name]
-            for name in self.method_sources
-            if callable(namespace.get(name))
+            name: namespace[name] for name in self.method_sources if callable(namespace.get(name))
         }
         return PersistedCell(captured_locals=captured_locals, defined_methods=defined_methods)
 
