@@ -1734,6 +1734,7 @@ class ActorRuntime:
                     # The wrapper's finally block writes here; it must exist
                     # before the cell runs so a raise cannot leave it unbound.
                     exec_globals["__repl_captured_locals__"] = {}
+                    succeeded = False
                     try:
                         coro = prepared.run(exec_globals)
                         with agent_async_safety_context():
@@ -1747,9 +1748,10 @@ class ActorRuntime:
                                     ) from None
                             else:
                                 result_value = await coro
+                        succeeded = True
                     finally:
                         # Keep REPL state even when the cell raises or is cancelled.
-                        persisted = prepared.persist(exec_globals)
+                        persisted = prepared.persist(exec_globals, succeeded=succeeded)
                     captured_locals = persisted.captured_locals
                     defined_methods = persisted.defined_methods
 

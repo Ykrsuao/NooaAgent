@@ -27,6 +27,7 @@ import ast
 import contextlib
 import io
 import linecache
+import logging
 import tokenize
 import types
 from collections.abc import Awaitable, Callable, Mapping
@@ -34,6 +35,8 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from nooa.events import _NO_RETURN, ExecutionResult, ExecutionSignal
+
+logger = logging.getLogger(__name__)
 
 
 class _HookedBuffer(io.StringIO):
@@ -111,25 +114,161 @@ def _indent(code: str, prefix: str) -> str:
 _NEVER_GLOBAL = frozenset({"self", "asyncio", "__builtins__"})
 
 
-def _assigned_names(tree: ast.Module) -> set[str]:
-    """Names this cell binds at module level, excluding nested scopes.
+class _ModuleScopeBinder(ast.NodeVisitor):
+    """Collect names the cell binds in *its own* scope.
 
-    A name needs ``global`` only when the cell *assigns* it: that is what makes
-    ``x = x + 5`` read the previous value instead of raising UnboundLocalError.
-    Scanning the cell — rather than the namespace — keeps the declaration list
-    proportional to what the cell touches. Declaring every name in the namespace
-    instead would make the wrapper's ``finally`` capture the agent module's
-    entire global scope into ``captured_locals`` on every cell.
+    ``ast.walk`` is wrong here: it descends into comprehensions and nested
+    function bodies, whose bindings are local to those scopes. Declaring such a
+    name ``global`` would both miss the real binding and pull the outer value
+    into ``captured_locals`` — the leak that assignment-driven globals exist to
+    prevent. So this visitor stops at every new scope.
+
+    ``Del`` counts as a binding: ``del x`` compiles ``x`` as a local unless it
+    is declared global, so without it a cell that deletes a session variable
+    raises UnboundLocalError before the delete runs.
     """
-    found: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            found.add(node.id)
-        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
-            found.add(node.target.id)
-        elif isinstance(node, ast.Global):
-            found.update(node.names)
-    return found
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    # --- scopes that do NOT introduce a new binding scope for our purposes ---
+    def visit_Module(self, node: ast.Module) -> None:
+        for child in node.body:
+            self.visit(child)
+
+    def visit_If(self, node: ast.If) -> None:
+        # ``test`` can hold a walrus, which binds in this scope.
+        self.visit(node.test)
+        for child in (*node.body, *node.orelse):
+            self.visit(child)
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.iter)
+        self._bind_target(node.target)
+        for child in (*node.body, *node.orelse):
+            self.visit(child)
+
+    visit_AsyncFor = visit_For
+
+    def visit_While(self, node: ast.While) -> None:
+        self.visit(node.test)
+        for child in (*node.body, *node.orelse):
+            self.visit(child)
+
+    def visit_With(self, node: ast.With) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._bind_target(item.optional_vars)
+        for child in node.body:
+            self.visit(child)
+
+    visit_AsyncWith = visit_With
+
+    def visit_Try(self, node: ast.Try) -> None:
+        for child in (*node.body, *node.orelse, *node.finalbody):
+            self.visit(child)
+        for handler in node.handlers:
+            # ``except E as err`` binds ``err`` only inside the handler, and
+            # Python deletes it afterwards; it is never session state.
+            if handler.type is not None:
+                self.visit(handler.type)
+            for child in handler.body:
+                self.visit(child)
+
+    def visit_TryStar(self, node: Any) -> None:
+        self.visit_Try(node)
+
+    # --- statements that bind a module-level name ---------------------------
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            self._bind_target(target)
+        self.visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self._bind_target(node.target)
+            self.visit(node.value)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._bind_target(node.target)
+        self.visit(node.value)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self.names.add(target.id)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        # ``:=`` binds in the enclosing scope, which here is the cell's.
+        self._bind_target(node.target)
+        self.visit(node.value)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self.names.add(alias.asname or alias.name.split(".")[0])
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            if alias.name != "*":
+                self.names.add(alias.asname or alias.name)
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.names.update(node.names)
+
+    # --- scopes that DO start a new binding scope: do not descend -----------
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        pass
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        pass
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        pass
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        pass
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        pass
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        pass
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        pass
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        pass
+
+    # --- helpers -----------------------------------------------------------
+    def _bind_target(self, target: ast.expr) -> None:
+        """Record every Name a (possibly destructuring) target binds."""
+        if isinstance(target, ast.Name):
+            self.names.add(target.id)
+        elif isinstance(target, ast.Starred):
+            self._bind_target(target.value)
+        elif isinstance(target, ast.Tuple | ast.List):
+            for element in target.elts:
+                self._bind_target(element)
+        # Attribute and Subscript targets mutate an existing object; they bind
+        # no new name and must not be declared global.
+
+
+def _assigned_names(tree: ast.Module) -> set[str]:
+    """Names this cell binds in its own scope.
+
+    A name needs ``global`` only when the cell *binds* it: that is what makes
+    ``x = x + 5`` read the previous value instead of raising UnboundLocalError,
+    and what lets ``del x`` reach the surrounding namespace. Scanning the cell —
+    rather than the namespace — keeps the declaration list proportional to what
+    the cell touches. Declaring every name in the namespace instead would make
+    the wrapper's ``finally`` capture the agent module's entire global scope
+    into ``captured_locals`` on every cell.
+    """
+    binder = _ModuleScopeBinder()
+    binder.visit(tree)
+    return binder.names
 
 
 def _global_declarations(tree: ast.Module, bindings: Mapping[str, Any]) -> tuple[str, ...]:
@@ -213,11 +352,25 @@ class PreparedCell:
         exec(compile(self.code, self.filename, "exec"), namespace)
         return namespace["__repl_wrapper__"]()
 
-    def persist(self, namespace: dict[str, Any]) -> PersistedCell:
+    def persist(self, namespace: dict[str, Any], *, succeeded: bool) -> PersistedCell:
         """Fold the cell's locals back into ``namespace`` and bind its helpers.
 
         Must run after :meth:`run` completes, including when the cell raised or
         returned via signal: the wrapper captures locals in a ``finally``.
+
+        ``succeeded`` says whether the cell ran to completion. It gates the two
+        things that would otherwise rewrite state a failed cell should not
+        touch:
+
+        * Helpers are re-executed from the cell AST so later cells get
+          source-relative line numbers. A failed cell's helpers stay defined
+          only if the wrapper already bound them, matching the in-process
+          adapter, which reports no ``defined_methods`` for a failed cell.
+        * The ``linecache`` entry is switched to the original source so helper
+          tracebacks line up. Doing that for a *failed* cell would make the
+          failing frame's own source line unfindable, because the traceback
+          points at wrapper coordinates while the cache would hold source
+          coordinates.
 
         Both callers get the same two views. The worker keeps them in the child
         and reports empty ones upward (live objects cannot cross the process
@@ -229,13 +382,10 @@ class PreparedCell:
         # key to build its result. Removing it here emptied ``captured_locals``
         # on exactly the signal path.
         raw = namespace.get("__repl_captured_locals__", {})
-        # Bound methods are helper objects, not session state: they are
-        # recompiled below and must not be mistaken for a value the cell produced.
-        captured_locals = {
-            name: value
-            for name, value in raw.items()
-            if not (callable(value) and hasattr(value, "__self__"))
-        }
+        # Every captured name is session state. Bound methods included: a cell
+        # may legitimately do ``f = self.some_tool`` and call ``f()`` later, and
+        # in the worker this namespace *is* the state.
+        captured_locals = dict(raw)
         for name, value in captured_locals.items():
             namespace[name] = value
 
@@ -244,26 +394,39 @@ class PreparedCell:
             for node in self.tree.body
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         ]
-        if func_defs:
-            # Helpers are compiled from the cell AST, not through the wrapper,
-            # so their line numbers are source-relative. Point linecache back at
-            # the original source to keep later-cell tracebacks accurate.
-            exec(
-                compile(ast.Module(body=func_defs, type_ignores=[]), self.filename, "exec"),
-                namespace,
-            )
-            linecache.cache[self.filename] = (
-                len(self.original_source),
-                None,
-                self.original_source.splitlines(keepends=True),
-                self.filename,
-            )
-            # The wrapper captured the wrapped function objects; persist the
-            # direct-compiled versions so later calls use source-relative lines.
-            for node in func_defs:
-                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                    if node.name in namespace:
-                        captured_locals[node.name] = namespace[node.name]
+        if func_defs and succeeded:
+            # Helpers are compiled from the cell AST, not through the wrapper, so
+            # their line numbers are source-relative and later-cell tracebacks
+            # point at the helper's own source.
+            #
+            # This re-runs the cell's decorators. If one of them raises, that
+            # error must not replace the cell's own outcome — ``persist`` runs in
+            # a ``finally``, so an exception here would mask a ``return_result``
+            # signal, a ``SystemExit`` message, or a cancellation. The cell's
+            # result is already decided; a helper that failed to rebind is a
+            # missing name, which the next cell reports on its own.
+            try:
+                exec(
+                    compile(ast.Module(body=func_defs, type_ignores=[]), self.filename, "exec"),
+                    namespace,
+                )
+            except Exception:  # noqa: BLE001 - never mask the cell's own outcome
+                logger.debug("helper re-execution failed during persist", exc_info=True)
+            else:
+                # The direct-compiled helpers carry source-relative line numbers;
+                # point the cache at the original source so their tracebacks match.
+                linecache.cache[self.filename] = (
+                    len(self.original_source),
+                    None,
+                    self.original_source.splitlines(keepends=True),
+                    self.filename,
+                )
+                # The wrapper captured the wrapped function objects; persist the
+                # direct-compiled versions so later calls use source-relative lines.
+                for node in func_defs:
+                    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                        if node.name in namespace:
+                            captured_locals[node.name] = namespace[node.name]
 
         for name, source in self.method_sources.items():
             fn = namespace.get(name)
@@ -320,8 +483,13 @@ def prepare_cell(
         lines = code.split("\n")
         if 1 <= last_line_no <= len(lines):
             original = lines[last_line_no - 1]
-            col = last_stmt.col_offset
-            lines[last_line_no - 1] = f"{original[:col]}return {original[col:]}"
+            # ``col_offset`` is a UTF-8 *byte* offset, while ``original`` is a
+            # str indexed by characters. Slicing the str directly shifts the
+            # insertion point on any line with non-ASCII text before the last
+            # statement — ``d = {'café': 1}; d['café']`` became
+            # ``...; dreturn ['café']``. Round-trip through bytes to agree.
+            prefix = original.encode("utf-8")[: last_stmt.col_offset].decode("utf-8")
+            lines[last_line_no - 1] = f"{prefix}return {original[len(prefix) :]}"
             code = "\n".join(lines)
             implicit_return_added = True
 
@@ -421,11 +589,13 @@ async def run_cell_source(
             # The wrapper's finally block writes into this key; it must exist
             # before the cell runs so a raise cannot leave it unbound.
             namespace["__repl_captured_locals__"] = {}
+            succeeded = False
             try:
                 result_value = await cell.run(namespace)
+                succeeded = True
             finally:
                 # Keep REPL state even when the cell raises or returns via signal.
-                defined_methods = cell.persist(namespace).defined_methods
+                defined_methods = cell.persist(namespace, succeeded=succeeded).defined_methods
                 # persist() reads the key rather than popping it (the caller's
                 # error path may still need it), so the worker clears it here:
                 # its namespace outlives the cell.
