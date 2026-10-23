@@ -14,17 +14,15 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import logging
-import multiprocessing as mp
 import os
-import signal
 import time
 from multiprocessing.connection import Connection
-from multiprocessing.process import BaseProcess
 from typing import Any
 
 from nooa.errors.formatting import _hard_bound_text
 from nooa.events import ExecutionResult
 from nooa.runtime.sandbox import wire
+from nooa.runtime.sandbox.backends import CellBackend, open_backend, require_start_method
 from nooa.runtime.sandbox.config import ResolvedSpec, SandboxConfig, resolve_spec
 from nooa.runtime.sandbox.errors import (
     CellMemoryError,
@@ -41,7 +39,6 @@ from nooa.runtime.sandbox.serialization import (
     effective_error_limit,
     is_picklable,
 )
-from nooa.runtime.sandbox.worker import worker_main
 
 logger = logging.getLogger(__name__)
 
@@ -65,26 +62,6 @@ def _bounded_text(value: object, fallback: str, *, limit: int) -> str:
 # a config that names a working root inherit another config's failure (or the
 # reverse). ``None`` is the root resolved from the environment.
 _CAPS_CACHE: dict[str | None, Capabilities] = {}
-
-
-def _is_container_proc(proc: Any) -> bool:
-    """True for a ``ContainerProcess`` (checked by duck type, not import)."""
-    return hasattr(proc, "release")
-
-
-def _release_worker(proc: Any) -> None:
-    """Revoke a container worker's ACLs and close its job/handles.
-
-    A no-op for ``multiprocessing`` processes, which own no OS resources the
-    parent must undo. Kept untyped so the fork/spawn paths stay importable on
-    platforms without the Win32 launcher.
-    """
-    release = getattr(proc, "release", None)
-    if release is not None:
-        try:
-            release()
-        except Exception:  # noqa: BLE001 - teardown must not raise
-            logger.debug("container worker release failed", exc_info=True)
 
 
 def _capabilities(runtime_root: str | None = None) -> Capabilities:
@@ -143,17 +120,7 @@ class SandboxedExecutor:
         max_error: int | None = None,
         error_tail: int | None = None,
     ):
-        if config.start_method not in mp.get_all_start_methods():
-            hint = (
-                " On Windows use start_method='spawn': the container process is created by "
-                "the AppContainer launcher, which cannot inherit live objects."
-                if os.name == "nt"
-                else " Run the agent in a supported Linux environment to use the sandbox backend."
-            )
-            raise SandboxUnavailable(
-                f"Sandbox execution requires the {config.start_method!r} process start method, "
-                f"which is unavailable on this platform.{hint}"
-            )
+        require_start_method(config)
         self._agent = agent
         self._config = config
         self._cell_timeout = cell_timeout
@@ -199,24 +166,17 @@ class SandboxedExecutor:
                 "; ".join(missing),
             )
 
-        self._ctx = mp.get_context(config.start_method)
-        # Windows has its own launcher: SECURITY_CAPABILITIES is a creation-time
-        # attribute, so multiprocessing's CreateProcess cannot enter a container.
-        self._uses_container = os.name == "nt" and caps.filesystem == "appcontainer"
-        self._runtime_root: Any = None
-        # Last ``prepare_root`` summary. Carried into startup failures so the
-        # real precondition problem is visible instead of only its symptom.
-        self._runtime_summary: str = ""
-        if self._uses_container:
+        # One seam for "how is a worker created and reaped here". Everything
+        # below treats the backend as opaque: no platform checks, no duck typing.
+        runtime_root: Any = None
+        if os.name == "nt" and caps.filesystem == "appcontainer":
             from nooa.runtime.sandbox.win_runtime import resolve_root
 
-            self._runtime_root = resolve_root(config.runtime_root)
-            if config.start_method != "spawn":
-                raise SandboxUnavailable(
-                    "the AppContainer backend requires start_method='spawn': the launcher "
-                    "creates the process itself and cannot inherit live objects"
-                )
-        self._proc: BaseProcess | None = None
+            runtime_root = resolve_root(config.runtime_root)
+        self._backend: CellBackend = open_backend(
+            config, self._spec, caps, runtime_root=runtime_root
+        )
+        self._proc: Any = None
         self._conn: Connection | None = None
         self._lock = asyncio.Lock()
         self._req_id = 0
@@ -255,17 +215,13 @@ class SandboxedExecutor:
 
     # --- worker lifecycle --------------------------------------------------
     def _start_worker(self) -> None:
-        if self._uses_container:
-            self._start_container_worker()
-            return
-        parent_conn, child_conn = self._ctx.Pipe(duplex=True)
         init: dict[str, Any] = {
             "restrictions": self._restrictions,
             "spec": self._spec,
             "max_error": self._max_error,
             "error_tail": self._error_tail,
         }
-        if self._config.start_method == "spawn":
+        if self._blueprint is not None:
             # Nothing can be inherited: the child imports the agent class and
             # rebuilds the namespace, brokering every self.* access.
             #
@@ -278,66 +234,7 @@ class SandboxedExecutor:
             init["mode"] = "fork"
             init["agent"] = self._agent
             init["framework_builtins"] = self._framework_builtins
-        proc = self._ctx.Process(
-            target=worker_main, args=(child_conn, init), daemon=True, name="nooa-sandbox-worker"
-        )
-        proc.start()
-        child_conn.close()
-        self._conn = parent_conn
-        self._proc = proc
-
-    def _start_container_worker(self) -> None:
-        """Start the worker inside an AppContainer (Windows).
-
-        The launcher grants the ACLs, creates the Job Object, spawns suspended,
-        assigns the job, resumes, and completes a ready handshake. The broker
-        connection it returns is a plain ``multiprocessing`` pipe — the container
-        can use it because the child receives a duplicated handle, not a name
-        lookup, which is why none of the broker code branches on platform.
-        """
-        from nooa.runtime.sandbox.win_launcher import start_container_worker
-        from nooa.runtime.sandbox.win_runtime import _workspace_packages, prepare_root
-
-        # Logged, not discarded: the summary says whether the package copy and
-        # the tokenizer cache are usable. Both are silent preconditions of the
-        # launch, and a failure here shows up later as an opaque worker-start
-        # error inside the sandbox.
-        #
-        # Every distribution this process imported goes into the root: a spawned
-        # worker imports the agent's module by name, and an agent that lives in
-        # a host package (nooa_cli's coding agent, for instance) would otherwise
-        # fail with ModuleNotFoundError before its first cell.
-        summary = prepare_root(self._runtime_root, sync=True, packages=_workspace_packages())
-        logger.debug("sandbox runtime prepared: %s", summary)
-        self._runtime_summary = summary
-        init: dict[str, Any] = {
-            "restrictions": self._restrictions,
-            "spec": self._spec,
-            "max_error": self._max_error,
-            "error_tail": self._error_tail,
-            "mode": "blueprint",
-            "blueprint": self._blueprint,
-        }
-        try:
-            handles = start_container_worker(
-                init,
-                self._spec,
-                self._runtime_root,
-                # None lets the launcher mint one per start. The worker is
-                # restarted after a kill, and a restarted worker is a new
-                # process that should not inherit the dead one's identity.
-                container_name=self._config.container_name,
-                workspace=self._config.workspace,
-                env_passthrough=self._config.env_passthrough,
-            )
-        except SandboxUnavailable as exc:
-            # The worker's own error says what failed inside the sandbox; the
-            # runtime summary says whether the preconditions were ever met
-            # (package copy, tokenizer cache). Without both, diagnosing a clean
-            # CI runner means guessing.
-            raise SandboxUnavailable(f"{exc} [runtime: {self._runtime_summary}]") from exc
-        self._conn = handles.conn
-        self._proc = handles.proc
+        self._proc, self._conn = self._backend.start(init)
 
     def _detach_worker(self) -> Any:
         """Clear the proc/conn refs and close the pipe; return the proc to reap."""
@@ -359,13 +256,13 @@ class SandboxedExecutor:
         proc = self._detach_worker()
         if proc is None:
             return
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=1.0)
-        if proc.is_alive():
-            proc.kill()
-            proc.join(timeout=1.0)
-        _release_worker(proc)
+        if self._backend.is_alive(proc):
+            self._backend.terminate(proc)
+            self._backend.join(proc, 1.0)
+        if self._backend.is_alive(proc):
+            self._backend.kill(proc)
+            self._backend.join(proc, 1.0)
+        self._backend.release(proc)
 
     async def _aterminate_worker(self) -> None:
         """Async teardown: send signals inline (fast, non-blocking) but run the
@@ -374,16 +271,15 @@ class SandboxedExecutor:
         proc = self._detach_worker()
         if proc is None:
             return
-        if proc.is_alive():
-            proc.terminate()
-            await asyncio.to_thread(proc.join, 1.0)
-        if proc.is_alive():
-            proc.kill()
-            await asyncio.to_thread(proc.join, 1.0)
+        if self._backend.is_alive(proc):
+            self._backend.terminate(proc)
+            await asyncio.to_thread(self._backend.join, proc, 1.0)
+        if self._backend.is_alive(proc):
+            self._backend.kill(proc)
+            await asyncio.to_thread(self._backend.join, proc, 1.0)
         # Revoking container ACLs is a few Win32 calls per path; keep it off the
         # loop for the same reason as the join.
-        if _is_container_proc(proc):
-            await asyncio.to_thread(_release_worker, proc)
+        await asyncio.to_thread(self._backend.release, proc)
 
     async def _spawn_worker(self) -> None:
         """Start the worker without blocking the loop when that is safe.
@@ -395,7 +291,7 @@ class SandboxedExecutor:
         documented way to deadlock a fork. ``spawn`` on a non-container backend
         is a fresh interpreter with no inherited state, so it can move too.
         """
-        if self._config.start_method == "fork":
+        if self._backend.start_on_loop_thread():
             self._start_worker()  # fork stays on the loop thread
             return
         await asyncio.to_thread(self._start_worker)
@@ -743,26 +639,8 @@ class SandboxedExecutor:
     # --- error synthesis ---------------------------------------------------
     def _classify_worker_death(self, exc: WorkerDiedError) -> Exception:
         proc = self._proc
-        code = getattr(proc, "exitcode", None)
-        if os.name == "nt":
-            # A Job Object terminates the process with STATUS_CONTROL_C_EXIT when
-            # the per-job CPU limit is reached (measured by the M0 probe).
-            from nooa.runtime.sandbox.win_launcher import EXIT_JOB_TIME_LIMIT
-
-            if code == EXIT_JOB_TIME_LIMIT:
-                return CellTimeoutError("cell exceeded its CPU-time limit and was killed")
-        # Neither SIGXCPU nor SIGKILL exists on Windows; a missing constant must
-        # not turn a worker death into an AttributeError here.
-        sig_xcpu = getattr(signal, "SIGXCPU", None)
-        sig_kill = getattr(signal, "SIGKILL", None)
-        if sig_xcpu is not None and code == -sig_xcpu:
-            return CellTimeoutError("cell exceeded its CPU-time limit and was killed")
-        if sig_kill is not None and code == -sig_kill:
-            return CellMemoryError(
-                "worker was killed (out-of-memory or resource limit). "
-                "Reduce the cell's memory use or raise max_memory_mb."
-            )
-        return exc
+        code = self._backend.exitcode(proc) if proc is not None else None
+        return self._backend.classify_death(code) or exc
 
     _RESET_NOTE = (
         " The worker was restarted, so variables/functions defined in earlier "

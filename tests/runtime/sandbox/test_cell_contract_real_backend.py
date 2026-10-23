@@ -69,8 +69,14 @@ def _sandbox_config() -> SandboxConfig:
     return SandboxConfig(require=False, network=True, filesystem=False, start_method=_START_METHOD)
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 async def executor():
+    """One worker for the whole module.
+
+    Starting a container worker re-syncs the runtime root and waits for a ready
+    handshake — tens of seconds. Per-test fixtures would pay that once per case
+    and dominate the suite's runtime.
+    """
     ex = SandboxedExecutor(
         _RecorderAgent(),
         _sandbox_config(),
