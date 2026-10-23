@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 
 from nooa.events import ExecutionSignal
-from nooa.runtime.sandbox.cell_core import run_cell_source
+from nooa.runtime.cell_core import run_cell_source
 
 
 @pytest.mark.asyncio

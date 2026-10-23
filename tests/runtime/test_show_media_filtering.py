@@ -12,7 +12,7 @@ from nooa.config import CodeActConfig
 from nooa.events import PythonOutput, ResultStatus
 from nooa.media import Audio, File, Image, Video
 from nooa.runtime.media_capture import _media_buffer_var
-from nooa.runtime.sandbox.cell_core import run_cell_source
+from nooa.runtime.cell_core import run_cell_source
 from nooa.strategies.codeact import CodeActStrategy
 from nooa.unifiedllm import FakeLLMClient, LLMResponse, ToolCall
 from nooa.unifiedllm.media_inputs import attachment_kind, removed_media_notice

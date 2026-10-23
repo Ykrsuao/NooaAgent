@@ -1,17 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Cell execution core used inside the sandbox worker.
+"""REPL semantics for one generated code cell.
 
-``run_cell_source`` reproduces the REPL semantics of
-``ActorRuntime.execute_code`` (the ``wrap_in_function=True`` path): an async
-wrapper that captures the last-expression / explicit ``return`` value, persists
-locals into the namespace, registers the cell with ``linecache`` for accurate
-tracebacks, and surfaces ``return_result()`` as an ``ExecutionSignal``.
+``run_cell_source`` implements the ``wrap_in_function=True`` contract that both
+execution backends share: an async wrapper that captures the last-expression or
+explicit ``return`` value, persists locals into the namespace, registers the cell
+with ``linecache`` for accurate tracebacks, and surfaces ``return_result()`` as
+an ``ExecutionSignal``.
 
-It runs *inside the worker*, on a plain namespace dict, with no dependency on the
-live agent or the parent event loop — those concerns stay on the parent. Keeping
-the wrapper string byte-for-byte aligned with the actor preserves
-``wrapper_line_offset`` so error line numbers match the in-process backend.
+It works on a plain namespace dict and depends only on ``nooa.events`` and the
+standard library. It is deliberately not part of ``runtime.sandbox``: the sandbox
+is one adapter of this contract, not its owner. The other adapter is
+``ActorRuntime.execute_code`` in ``nooa.runtime.actor``, which adds the
+in-process concerns this module leaves out — contextvar-backed stream capture for
+concurrent cells, async-safety patching, and ``asyncio.wait_for`` timeouts.
+
+The two adapters must produce identical observable results; ``tests/runtime/
+test_cell_contract.py`` runs one corpus through both and fails on any divergence.
+Keeping the wrapper string aligned between them preserves ``wrapper_line_offset``
+so error line numbers match regardless of backend.
 """
 
 from __future__ import annotations

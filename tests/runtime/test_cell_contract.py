@@ -26,7 +26,7 @@ import pytest
 
 from nooa.agent import Agent
 from nooa.runtime.actor import ActorRuntime
-from nooa.runtime.sandbox.cell_core import run_cell_source
+from nooa.runtime.cell_core import run_cell_source
 from nooa.unifiedllm import FakeLLMClient
 
 
