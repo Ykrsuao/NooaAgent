@@ -263,6 +263,19 @@ async def test_timeout_recovers_cwd_and_reruns_init(tmp_path, executable):
         await shell.close()
 
 
+async def test_non_filesystem_location_keeps_the_last_directory(tmp_path, executable):
+    # ProviderPath for the registry is "HKEY_LOCAL_MACHINE\SOFTWARE": relative,
+    # and not a directory. Recording it made every later restart fail.
+    shell = PowerShellSession(tmp_path, executable=executable)
+    try:
+        assert (await shell.run("Set-Location HKLM:\\SOFTWARE"))[2] == 0
+        assert shell.cwd == tmp_path
+        await asyncio.wait_for(shell.reset(), 60)
+        assert await shell.run(_python("import os;print(os.getcwd())")) == (str(tmp_path), "", 0)
+    finally:
+        await shell.close()
+
+
 async def test_explicit_exit_is_reported_and_next_command_restarts(session):
     assert (await session.run("exit 9"))[2] == 9
     assert await session.run("Write-Output restarted") == ("restarted", "", 0)
@@ -282,6 +295,26 @@ async def test_explicit_exit_drains_output_for_a_slow_stream_consumer(session):
     assert "".join(output["stdout"]) == "x" * 1000000
     assert "".join(output["stderr"]) == "y" * 1000000
     assert done == "9,0"
+    assert await session.run("Write-Output restarted") == ("restarted", "", 0)
+
+
+@pytest.mark.parametrize(
+    "breaks_console",
+    [
+        "[Console]::OutputEncoding = [System.Text.Encoding]::Unicode",
+        "[Console]::SetOut([System.IO.TextWriter]::Null)",
+    ],
+)
+async def test_command_that_breaks_the_console_writer_still_returns(session, breaks_console):
+    # Both commands finish, but the end markers are then written in a form the
+    # reader cannot match. The reply still arrives, so the call must return;
+    # it used to wait for those markers forever, past any timeout.
+    stdout, stderr, code, timed_out = await asyncio.wait_for(
+        session.run_with_timeout_flag(f"{breaks_console}; 'after'", timeout=5), 30
+    )
+    assert (code, timed_out) == (0, False)
+    assert "end markers never arrived" in stderr
+    # The unparseable host was replaced; the next command runs in a fresh one.
     assert await session.run("Write-Output restarted") == ("restarted", "", 0)
 
 

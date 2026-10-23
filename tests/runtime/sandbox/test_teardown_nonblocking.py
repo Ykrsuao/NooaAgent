@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 
 import pytest
@@ -109,3 +110,67 @@ def test_sync_terminate_still_available_for_close_sync():
     ex._terminate_worker()  # must not raise; reaps synchronously
     assert proc.joins >= 1 and not proc.is_alive()
     assert ex._proc is None
+
+
+class _StartedProc:
+    """The worker a slow start hands over; records how it was torn down."""
+
+    def __init__(self) -> None:
+        self._alive = True
+        self.released = False
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def terminate(self) -> None:
+        self._alive = False
+
+    def kill(self) -> None:
+        self._alive = False
+
+    def join(self, timeout: float | None = None) -> None:
+        pass
+
+    def release(self) -> None:  # what a container worker must always get
+        self.released = True
+
+
+class _Conn:
+    def send(self, message: object) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cold_start_still_hands_its_worker_to_aclose(monkeypatch):
+    """Cancelling the first cell mid-start must not orphan the worker.
+
+    to_thread() cannot stop its thread, which stored the worker after the
+    cancelled cell had released the lock. aclose() then found no worker, and a
+    container's ACL grants and journal lock lived until the parent exited.
+    """
+    from nooa.runtime.sandbox import executor as ex_mod
+    from nooa.runtime.sandbox.guards import Capabilities
+
+    monkeypatch.setitem(ex_mod._CAPS_CACHE, None, Capabilities(detail={"reason": "test"}))
+    ex = SandboxedExecutor(
+        _Agent(), SandboxConfig(require=False, start_method="spawn"), cell_timeout=10.0
+    )
+    began = threading.Event()
+    proc = _StartedProc()
+
+    def slow_start() -> None:
+        began.set()
+        time.sleep(0.5)  # a cold container start takes seconds
+        ex._conn, ex._proc = _Conn(), proc  # type: ignore[assignment]
+
+    monkeypatch.setattr(ex, "_start_worker", slow_start)
+    cell = asyncio.create_task(ex.run_cell("1"))
+    await asyncio.to_thread(began.wait, 5)
+    cell.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cell
+    await ex.aclose()
+    assert proc.released and not proc.is_alive()

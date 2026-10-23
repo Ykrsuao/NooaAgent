@@ -106,6 +106,30 @@ def test_sandbox_network_flag_is_separate(stubbed_serve):
     assert stubbed_serve["sandbox"].network is True
 
 
+def test_sandbox_session_strategy_is_derived_from_the_decorated_default(monkeypatch, tmp_path):
+    """--sandbox must change the backend only, not restate the rest by hand."""
+    from nooa_acp.server import CodingACPAdapter
+    from nooa_cli.coding import CodingAgent
+
+    from nooa.config import CodeActConfig
+    from nooa.runtime.sandbox.config import SandboxConfig
+    from nooa.strategies import CodeActStrategy
+
+    # A decorated default that differs from the old hard-coded copy.
+    monkeypatch.setattr(
+        CodingAgent.handle,
+        "_strategy_override",
+        CodeActStrategy(config=CodeActConfig(cell_timeout=42.0)),
+    )
+    adapter = CodingACPAdapter(lambda: None, sandbox=SandboxConfig(require=True))
+    config = adapter._session_strategy(tmp_path).config
+
+    assert config.cell_timeout == 42.0
+    assert config.execution_backend == "sandbox"
+    assert config.sandbox.workspace == str(tmp_path)
+    assert config.sandbox.require is True
+
+
 def _console_script() -> str:
     """Locate the installed ``nooa-acp`` console script.
 

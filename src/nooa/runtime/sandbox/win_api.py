@@ -23,6 +23,12 @@ import ctypes
 import threading
 from ctypes import wintypes
 
+from nooa._win_job import (
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    ExtendedLimit,
+    JobObjectExtendedLimitInformation,
+)
+
 __all__ = [
     "MODIFY",
     "Child",
@@ -104,8 +110,6 @@ MODIFY = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE 
 
 # --- job objects ------------------------------------------------------------
 JobObjectBasicLimitInformation = 2
-JobObjectExtendedLimitInformation = 9
-JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
 JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
 JOB_OBJECT_LIMIT_JOB_TIME = 0x00000004
@@ -203,43 +207,8 @@ class _ExplicitAccessW(ctypes.Structure):
     ]
 
 
-class _BasicLimit(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", ctypes.c_int64),
-        ("PerJobUserTimeLimit", ctypes.c_int64),
-        ("LimitFlags", wintypes.DWORD),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", wintypes.DWORD),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
-    ]
-
-
-class _IoCounters(ctypes.Structure):
-    _fields_ = [
-        (name, ctypes.c_uint64)
-        for name in (
-            "ReadOperationCount",
-            "WriteOperationCount",
-            "OtherOperationCount",
-            "ReadTransferCount",
-            "WriteTransferCount",
-            "OtherTransferCount",
-        )
-    ]
-
-
-class _ExtendedLimit(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", _BasicLimit),
-        ("IoInfo", _IoCounters),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
+# Shared with the shell's job wrapper so the layout is defined once.
+_ExtendedLimit = ExtendedLimit
 
 
 # --- prototypes -------------------------------------------------------------

@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nooa._file_lock import lock_file
+from nooa._file_lock import lock_file, unlock_file
 
 __all__ = [
     "AclJournal",
@@ -56,6 +56,12 @@ _RUNTIME_ENV = "NOOA_SANDBOX_RUNTIME"
 _SUBDIR = "sandbox-runtime"
 _JOURNAL_STEM = "acl-journal"
 _JOURNAL_SUFFIX = ".jsonl"
+# Written first by build_root, so even a half-finished build is recognisable.
+# A non-empty directory without it is never deleted: --root is user input.
+_ROOT_MARKER = ".nooa-sandbox-root"
+_SYNC_LOCK = ".nooa-sync.lock"
+# Beside the cache, not in it: the launcher grants every file in the cache.
+_TOKENIZER_STAMP = ".tokenizer-cache.json"
 
 
 def default_container_name() -> str:
@@ -212,6 +218,21 @@ _COPY_DIRS = ("Lib", "DLLs", "libs", "include")
 _SKIP_STDLIB = ("__pycache__", "test", "tests", "idlelib", "tkinter", "turtledemo")
 
 
+def _is_removable_root(root: RuntimeRoot) -> bool:
+    """True for an empty directory or a root this module built.
+
+    Roots built before the marker existed are recognised by the marker
+    :func:`sync_package` leaves next to the interpreter it refreshed.
+    """
+    if not root.root.is_dir():
+        return False
+    if (root.root / _ROOT_MARKER).exists():
+        return True
+    if root.python.exists() and (root.site_packages / ".nooa-sync.json").exists():
+        return True
+    return not any(root.root.iterdir())
+
+
 def build_root(
     root: RuntimeRoot,
     *,
@@ -222,8 +243,15 @@ def build_root(
 
     This is stage one; :func:`sync_package` is stage two and must run after it.
     An existing root is removed first: a partial merge would produce an
-    interpreter whose DLLs and stdlib come from different builds.
+    interpreter whose DLLs and stdlib come from different builds. Only a root
+    this function created (it carries the marker) or an empty directory is
+    removed; anything else is refused, because ``--root`` is a path the user
+    typed and the removal is recursive. A file that cannot be removed (an
+    interpreter a running worker still holds) fails the build instead of
+    leaving that mix behind.
     """
+    from nooa.runtime.sandbox.errors import SandboxUnavailable
+
     source_prefix, source_sp = (
         (Path(interpreter_prefix), Path(site_packages))
         if interpreter_prefix and site_packages
@@ -234,9 +262,17 @@ def build_root(
     if not source_sp.is_dir():
         raise RuntimeError(f"{source_sp} is not a directory")
 
+    if root.root.exists() and not _is_removable_root(root):
+        raise SandboxUnavailable(
+            f"{root.root} is not empty and is not a sandbox runtime root built by this "
+            "command, so it will not be deleted. Pass --root a new or empty directory."
+        )
+
     started = time.perf_counter()
-    shutil.rmtree(root.root, ignore_errors=True)
+    if root.root.exists():
+        shutil.rmtree(root.root)
     root.root.mkdir(parents=True, exist_ok=True)
+    (root.root / _ROOT_MARKER).write_text("nooa sandbox runtime root\n", encoding="utf-8")
 
     for name in os.listdir(source_prefix):
         source = source_prefix / name
@@ -427,7 +463,30 @@ def sync_package(
     ``packages`` names additional importable distributions to mirror alongside
     ``nooa`` (see :func:`_workspace_packages`). Each gets its own signature, so
     a change to one does not force a re-copy of the other.
+
+    Sessions share one root, and two that start after a source edit both see a
+    stale signature. Unserialised, their rmtree/copytree interleaved: one
+    failed with FileExistsError or left a half-copied package. An exclusive
+    lock on a file in the root makes compare-and-copy one step.
     """
+    root.root.mkdir(parents=True, exist_ok=True)
+    fd = os.open(root.root / _SYNC_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        lock_file(fd)
+        try:
+            return _sync_package_locked(root, force=force, packages=packages)
+        finally:
+            unlock_file(fd)
+    finally:
+        os.close(fd)
+
+
+def _sync_package_locked(
+    root: RuntimeRoot,
+    *,
+    force: bool,
+    packages: dict[str, Path] | None,
+) -> str:
     from nooa.runtime.sandbox.errors import SandboxUnavailable
 
     source = _installed_package_dir()
@@ -710,6 +769,20 @@ def recover_stale_grants(root: RuntimeRoot) -> list[str]:
     return revoked
 
 
+def _tokenizer_signature(root: RuntimeRoot) -> dict[str, int] | None:
+    """Identify the ``tiktoken_ext`` the root's interpreter would validate with.
+
+    The expected hash a cache entry is checked against lives in that file, so
+    a cache warmed for one version of it is valid exactly while it is
+    unchanged. ``None`` when the root has no tiktoken at all.
+    """
+    try:
+        stat = (root.site_packages / "tiktoken_ext" / "openai_public.py").stat()
+    except OSError:
+        return None
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
 def warm_tokenizer_cache(root: RuntimeRoot) -> str:
     """Populate the tokenizer cache the container will read.
 
@@ -749,6 +822,19 @@ def warm_tokenizer_cache(root: RuntimeRoot) -> str:
     if not root.python.exists():
         return f"tokenizer cache not warmed: {root.python} is missing"
 
+    # Every container start ran an interpreter here to rebuild an encoding
+    # that was already cached. The stamp records which tiktoken_ext the cache
+    # was warmed for; a match with a non-empty cache needs no subprocess.
+    stamp = root.root / _TOKENIZER_STAMP
+    signature = _tokenizer_signature(root)
+    if signature is not None:
+        try:
+            warm = json.loads(stamp.read_text(encoding="utf-8")) == signature
+        except (OSError, ValueError):
+            warm = False
+        if warm and any(entry.is_file() for entry in cache.iterdir()):
+            return f"tokenizer cache ready at {cache} (warm)"
+
     import subprocess
 
     env = {**os.environ, "TIKTOKEN_CACHE_DIR": str(cache)}
@@ -787,6 +873,11 @@ def warm_tokenizer_cache(root: RuntimeRoot) -> str:
             f"tokenizer warm-up wrote nothing to {cache}; the container will "
             "fail to import the LLM stack"
         )
+    if signature is not None:
+        try:
+            stamp.write_text(json.dumps(signature), encoding="utf-8")
+        except OSError:
+            pass  # only costs the next start a warm-up
     return f"tokenizer cache ready at {cache} ({len(written)} file(s))"
 
 

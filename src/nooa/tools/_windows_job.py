@@ -13,47 +13,13 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 
+from nooa._win_job import (
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    ExtendedLimit,
+    JobObjectExtendedLimitInformation,
+)
+
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-
-class _BasicLimit(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", ctypes.c_int64),
-        ("PerJobUserTimeLimit", ctypes.c_int64),
-        ("LimitFlags", wintypes.DWORD),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", wintypes.DWORD),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
-    ]
-
-
-class _IoCounters(ctypes.Structure):
-    _fields_ = [
-        (name, ctypes.c_uint64)
-        for name in (
-            "ReadOperationCount",
-            "WriteOperationCount",
-            "OtherOperationCount",
-            "ReadTransferCount",
-            "WriteTransferCount",
-            "OtherTransferCount",
-        )
-    ]
-
-
-class _ExtendedLimit(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", _BasicLimit),
-        ("IoInfo", _IoCounters),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
-
 
 _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
 _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
@@ -106,10 +72,10 @@ class WindowsJob:
             raise
 
     def _set_kill_on_close(self, enabled: bool) -> None:
-        info = _ExtendedLimit()
-        info.BasicLimitInformation.LimitFlags = 0x2000 if enabled else 0
+        info = ExtendedLimit()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE if enabled else 0
         if not _kernel32.SetInformationJobObject(
-            self._handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+            self._handle, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
         ):
             raise ctypes.WinError(ctypes.get_last_error())
 

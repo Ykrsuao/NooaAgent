@@ -44,6 +44,18 @@ from nooa.tools._results import StreamDone, StreamEvent
 from nooa.tools._shell_session import ShellName, ShellSession, create_shell_session
 
 
+def _write_text_verbatim(path: Path, text: str) -> None:
+    """Write UTF-8 text without newline translation.
+
+    Text-mode ``write_text`` turns every "\\n" into ``os.linesep``, so on
+    Windows one edit rewrote a whole LF file as CRLF. Edits read with universal
+    newlines, as read() and Match anchors do, and now write exactly that text
+    on every platform: the behaviour Linux always had.
+    """
+    with path.open("w", encoding="utf-8", newline="") as target:
+        target.write(text)
+
+
 class FileWrite:
     """Result of a write/replace operation.
 
@@ -940,7 +952,7 @@ class ShellTools(Skill):
             ):
                 new_text += "\n"
             new_content = "".join(before) + new_text + "".join(after)
-            resolved.write_text(new_content, encoding="utf-8")
+            _write_text_verbatim(resolved, new_content)
 
             diff = f"--- a/{target.path}\n+++ b/{target.path}\n"
             diff += f"@@ -{target.start},{target.end - target.start + 1} @@\n"
@@ -974,7 +986,7 @@ class ShellTools(Skill):
                 )
 
             new_content = content.replace(old_text, new, 1)
-            resolved.write_text(new_content, encoding="utf-8")
+            _write_text_verbatim(resolved, new_content)
 
             return FileWrite(
                 path=target,
@@ -999,7 +1011,7 @@ class ShellTools(Skill):
         """
         resolved = self._resolve_path(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        _write_text_verbatim(resolved, content)
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return FileWrite(
             path=path,
