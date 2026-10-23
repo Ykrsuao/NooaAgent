@@ -833,7 +833,11 @@ async def test_require_true_raises_when_unavailable(monkeypatch):
     # The constructor validates the start method before the guardrails. Without
     # this the test would stop at the platform check on Windows and never reach
     # check_enforceable, so the assertions below would be untested there.
-    monkeypatch.setattr(ex_mod.mp, "get_all_start_methods", lambda: ["fork", "spawn"])
+    # The check itself lives in backends.require_start_method, which is where
+    # the multiprocessing module is now imported.
+    from nooa.runtime.sandbox import backends as backends_mod
+
+    monkeypatch.setattr(backends_mod.mp, "get_all_start_methods", lambda: ["fork", "spawn"])
     from nooa.runtime.sandbox.errors import SandboxUnavailable
 
     with pytest.raises(SandboxUnavailable) as excinfo:

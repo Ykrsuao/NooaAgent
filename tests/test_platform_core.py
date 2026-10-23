@@ -151,10 +151,11 @@ def test_sandbox_validates_the_configured_runtime_root(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("require", [False, True])
 def test_sandbox_requires_a_supported_process_start_method(monkeypatch, require):
-    from nooa.runtime.sandbox import executor
+    from nooa.runtime.sandbox import backends, executor
     from nooa.runtime.sandbox.config import SandboxConfig
     from nooa.runtime.sandbox.errors import SandboxUnavailable
 
-    monkeypatch.setattr(executor.mp, "get_all_start_methods", lambda: ["spawn"])
+    # require_start_method lives in backends, which owns the mp import.
+    monkeypatch.setattr(backends.mp, "get_all_start_methods", lambda: ["spawn"])
     with pytest.raises(SandboxUnavailable, match="fork"):
         executor.SandboxedExecutor(None, SandboxConfig(require=require), cell_timeout=1)
