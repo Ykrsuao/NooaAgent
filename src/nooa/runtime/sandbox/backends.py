@@ -206,10 +206,18 @@ class ContainerBackend:
         proc.join(timeout)
 
     def release(self, proc: Any) -> None:
-        """Revoke the ACLs and close the job/handles this launcher owns."""
+        """Revoke the ACLs and close the job/handles this launcher owns.
+
+        Teardown must not raise: a failed revoke leaves an ACE behind, and the
+        journal is what a later start uses to reclaim it. ``AttributeError`` is
+        deliberately *not* caught — it means a process that is not a
+        ``ContainerProcess`` reached this adapter, which is a programming error
+        that would otherwise be silent, and silently skipping the revoke is
+        exactly how grants leak.
+        """
         try:
             proc.release()
-        except Exception:  # noqa: BLE001 - teardown must not raise
+        except OSError:
             logger.debug("container worker release failed", exc_info=True)
 
     def classify_death(self, code: int | None) -> Exception | None:
@@ -228,17 +236,13 @@ class ContainerBackend:
         return False
 
 
-def open_backend(
-    config: Any,
-    spec: Any,
-    caps: Capabilities,
-    *,
-    runtime_root: Any = None,
-) -> CellBackend:
+def open_backend(config: Any, spec: Any, caps: Capabilities) -> CellBackend:
     """Pick the backend this host and config can actually run.
 
-    This is the only place the decision is made. Callers see a
-    :class:`CellBackend` and never branch on platform again.
+    This is the only place the decision is made, and the only place that acts on
+    it: the runtime root is resolved here rather than by the caller, so the
+    predicate cannot be duplicated and drift out of sync with the branch below.
+    Callers see a :class:`CellBackend` and never branch on platform again.
     """
     uses_container = os.name == "nt" and caps.filesystem == "appcontainer"
     if uses_container:
@@ -247,7 +251,12 @@ def open_backend(
                 "the AppContainer backend requires start_method='spawn': the launcher "
                 "creates the process itself and cannot inherit live objects"
             )
-        return ContainerBackend(_ContainerConfig(config, spec), runtime_root)
+        from nooa.runtime.sandbox.win_runtime import resolve_root
+
+        # Resolved here, not passed in: the root this backend will run from is
+        # the one the capability probe validated, and letting the caller supply
+        # it invites the two to disagree.
+        return ContainerBackend(_ContainerConfig(config, spec), resolve_root(config.runtime_root))
     return ProcessBackend(config.start_method)
 
 

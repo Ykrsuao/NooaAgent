@@ -76,6 +76,10 @@ async def executor():
     Starting a container worker re-syncs the runtime root and waits for a ready
     handshake — tens of seconds. Per-test fixtures would pay that once per case
     and dominate the suite's runtime.
+
+    A shared worker means a shared REPL namespace, so ``_isolate_namespace``
+    clears it between tests: without that, a case could pass by reading a name
+    an earlier case happened to define.
     """
     ex = SandboxedExecutor(
         _RecorderAgent(),
@@ -87,6 +91,29 @@ async def executor():
         yield ex
     finally:
         await ex.aclose()
+
+
+# Names the worker's namespace must keep for the next cell to run at all.
+_KEEP = ("self", "asyncio", "__builtins__", "__repl_captured_locals__", "__repl_wrapper__")
+
+
+@pytest.fixture(autouse=True)
+async def _isolate_namespace(executor):
+    """Drop what a previous test left in the worker's namespace.
+
+    The worker keeps one namespace for its lifetime, and sharing it is the
+    point of the module-scoped fixture. ``globals()`` inside a cell *is* that
+    namespace, so the reset runs there. A fresh subprocess per test would pay
+    the container start again and defeat the fixture.
+    """
+    yield
+    keep = ", ".join(repr(name) for name in _KEEP)
+    await executor.run_cell(
+        f"for _k in [k for k in list(globals()) if not k.startswith('__')]:\n"
+        f"    if _k not in ({keep},):\n"
+        f"        del globals()[_k]\n",
+        execution_count=999,
+    )
 
 
 @pytest.mark.parametrize("name,code,expected", CORPUS, ids=[c[0] for c in CORPUS])

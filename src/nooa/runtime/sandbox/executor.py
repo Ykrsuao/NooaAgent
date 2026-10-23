@@ -168,14 +168,7 @@ class SandboxedExecutor:
 
         # One seam for "how is a worker created and reaped here". Everything
         # below treats the backend as opaque: no platform checks, no duck typing.
-        runtime_root: Any = None
-        if os.name == "nt" and caps.filesystem == "appcontainer":
-            from nooa.runtime.sandbox.win_runtime import resolve_root
-
-            runtime_root = resolve_root(config.runtime_root)
-        self._backend: CellBackend = open_backend(
-            config, self._spec, caps, runtime_root=runtime_root
-        )
+        self._backend: CellBackend = open_backend(config, self._spec, caps)
         self._proc: Any = None
         self._conn: Connection | None = None
         self._lock = asyncio.Lock()
@@ -304,12 +297,21 @@ class SandboxedExecutor:
             return
         await self._spawn_worker()
 
+    def _worker_alive(self) -> bool:
+        """Liveness of the current worker, asked through the backend.
+
+        ``proc`` is opaque: each adapter knows how to interrogate its own
+        handle, and this is the only place the executor asks.
+        """
+        proc = self._proc
+        return proc is not None and self._backend.is_alive(proc)
+
     async def _ensure_worker(self) -> None:
         if self._disabled:
             raise WorkerDiedError(
                 "sandbox worker was killed and recovery='disabled'; no further cells can run"
             )
-        if self._proc is None or not self._proc.is_alive():
+        if not self._worker_alive():
             await self._aterminate_worker()
             await self._spawn_worker()
 
@@ -395,7 +397,7 @@ class SandboxedExecutor:
             else:
                 wait = poll
             if not conn.poll(max(0.01, wait)):
-                if self._proc is None or not self._proc.is_alive():
+                if not self._worker_alive():
                     raise WorkerDiedError("sandbox worker exited unexpectedly")
                 continue
             try:
@@ -667,10 +669,11 @@ class SandboxedExecutor:
         self._closed = True
         async with self._lock:
             conn = self._conn
-            if conn is not None and self._proc is not None and self._proc.is_alive():
+            proc = self._proc
+            if conn is not None and proc is not None and self._backend.is_alive(proc):
                 try:
                     conn.send({"op": "shutdown", "id": self._next_id()})
-                    await asyncio.to_thread(self._proc.join, 0.5)
+                    await asyncio.to_thread(self._backend.join, proc, 0.5)
                 except Exception:
                     pass
             await self._aterminate_worker()
