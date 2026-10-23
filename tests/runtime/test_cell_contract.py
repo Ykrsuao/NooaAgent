@@ -61,7 +61,11 @@ CORPUS: list[tuple[str, str, str, list[str]]] = [
     ("dict_literal", '{"a": 1, "b": 2}', "{'a': 1, 'b': 2}", []),
     ("multiline_call", "sum([\n    1,\n    2,\n])", "3", []),
     ("class_def", "class C:\n    pass\nC.__name__", "'C'", []),
+    ("rebind_module_const", "CONTRACT_CONST = CONTRACT_CONST + 1\nCONTRACT_CONST", "101", []),
 ]
+
+CONTRACT_CONST = 100
+"""Module-level data the rebind cell above reads and reassigns."""
 
 # Cells whose outcome is an error rather than a value.
 ERROR_CORPUS: list[tuple[str, str, str]] = [
@@ -74,19 +78,51 @@ ERROR_CORPUS: list[tuple[str, str, str]] = [
 def _comparable(result: Any) -> dict[str, Any]:
     """The fields both backends must agree on.
 
-    ``captured_locals`` and ``defined_methods`` are deliberately excluded: the
-    sandbox worker cannot send live objects back across the process boundary, so
-    they are documented as empty on the parent side (see
-    ``runtime/sandbox/serialization.py``).
+    Three exclusions, each for a stated reason:
+
+    * ``captured_locals`` and ``defined_methods`` hold live objects the worker
+      cannot send across the process boundary, so they are documented as empty
+      on the parent side (see ``runtime/sandbox/serialization.py``).
+    * ``wrapper_line_offset`` is not a backend constant. It counts the wrapper
+      header lines for *this* call, and the header grows by one line whenever a
+      session variable needs a ``global`` declaration. Two runs of the same cell
+      legitimately differ when their namespaces do. It is checked for internal
+      consistency in ``test_wrapper_offset_matches_the_emitted_header``.
     """
     return {
         "stdout": result.stdout,
         "stderr": result.stderr,
         "returned": repr(result.returned_value),
         "explicit_return": result.explicit_return,
-        "wrapper_line_offset": result.wrapper_line_offset,
         "error": type(result.error).__name__ if result.error else None,
     }
+
+
+@pytest.mark.asyncio
+async def test_error_line_numbers_point_at_the_user_source() -> None:
+    """Error formatting subtracts the offset, so the user must see their own line.
+
+    Checked end to end rather than against the other backend: the header grows a
+    line when a session variable needs a ``global`` declaration, so the raw
+    offset legitimately varies. What must not vary is the line the user is told
+    about.
+    """
+    from nooa.errors.formatting import format_error_for_llm
+
+    # The raise sits on line 2 of the cell, in both adapters.
+    code = "x = 1\nraise ValueError('boom')"
+
+    inprocess = await ActorRuntime(_RecorderAgent()).execute_code(
+        code, wrap_in_function=True, validate=False
+    )
+    sandbox = await run_cell_source(code, {"self": _RecorderAgent()}, execution_count=1)
+
+    for result in (inprocess, sandbox):
+        rendered = format_error_for_llm(
+            result.error, code, line_offset=result.wrapper_line_offset
+        )
+        assert "line 2" in rendered, rendered
+        assert "line 1" not in rendered, rendered
 
 
 @pytest.mark.asyncio
@@ -120,7 +156,10 @@ async def test_backends_agree(
     )
 
     sandbox_agent = _RecorderAgent()
-    sandbox = await run_cell_source(code, {"self": sandbox_agent}, execution_count=1)
+    # The worker's namespace is what the parent hands it; give it the same
+    # module-level names the in-process adapter finds in exec_globals.
+    namespace: dict[str, Any] = {"self": sandbox_agent, "CONTRACT_CONST": CONTRACT_CONST}
+    sandbox = await run_cell_source(code, namespace, execution_count=1)
 
     assert _comparable(sandbox) == _comparable(inprocess)
     assert sandbox_agent.calls == inprocess_agent.calls

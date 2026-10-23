@@ -1746,10 +1746,16 @@ class ActorRuntime:
                     # Build global declarations for session variables (REPL persistence)
                     # This allows code like `x = x + 5` to work when x was defined in a prior call
                     # Without this, Python sees `x = ...` and marks x as local, failing on the RHS
-                    # We need to declare as global any variable that was passed in builtins
+                    #
+                    # Both sources matter. ``builtins`` carries the session variables
+                    # a strategy re-injects between cells; ``exec_globals`` already
+                    # holds the agent module's own module-level names. Only listing
+                    # the first meant `MODULE_CONST = MODULE_CONST + 1` raised
+                    # UnboundLocalError in process while the sandbox backend — which
+                    # declares every non-callable namespace name — ran it fine.
                     global_vars = [
                         name
-                        for name, val in (builtins or {}).items()
+                        for name, val in {**exec_globals, **(builtins or {})}.items()
                         if (
                             not name.startswith("_")
                             and name not in ("self", "asyncio", "__builtins__")
