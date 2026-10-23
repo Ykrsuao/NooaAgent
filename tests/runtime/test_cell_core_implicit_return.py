@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The sandbox cell engine's implicit-return rewrite must not drop statements.
+"""The cell engine's implicit-return rewrite must not drop statements.
 
 ``run_cell_source`` prepends ``return `` to the last top-level expression so a
 cell's final value is returned (Jupyter semantics). It prepended at the start of
