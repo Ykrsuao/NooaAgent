@@ -117,6 +117,16 @@ jobs:
             "tests/unifiedllm/connect",
             "tests/runtime/test_generator_method_span_tree.py",
             "tests/runtime/test_producers.py",
+            # The cell contract and its two implementations. These used to live
+            # under tests/runtime/sandbox, so listing that directory covered
+            # them; they moved to tests/runtime when cell_core left the sandbox
+            # package, and this job enumerates paths explicitly.
+            "tests/runtime/test_cell_contract.py",
+            "tests/runtime/test_cell_core_implicit_return.py",
+            "tests/runtime/test_cell_core_state_persistence.py",
+            "tests/runtime/test_actor_global_rebind.py",
+            "tests/runtime/test_actor_implicit_return.py",
+            "tests/runtime/test_systemexit_no_escape.py",
             "tests/runtime/sandbox",
             "src/nooa/runtime/tests/test_producers.py",
             "tests/tracing/test_context_isolation.py",
