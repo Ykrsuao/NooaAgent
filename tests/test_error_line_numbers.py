@@ -326,8 +326,7 @@ class TestOffsetClearing:
         )
         assert result2.error is None, f"read-only use of a session variable failed: {result2.error}"
         assert result2.wrapper_line_offset == 2, (
-            f"Expected offset 2 for a cell that declares nothing, got "
-            f"{result2.wrapper_line_offset}"
+            f"Expected offset 2 for a cell that declares nothing, got {result2.wrapper_line_offset}"
         )
 
         # Rebinding a session variable needs the declaration: offset becomes 3.
