@@ -20,6 +20,7 @@ import ast
 import contextlib
 import io
 import linecache
+import tokenize
 import types
 from collections.abc import Callable
 from typing import Any, cast
@@ -67,7 +68,36 @@ def _has_top_level_return(tree: ast.Module) -> bool:
 
 
 def _indent(code: str, prefix: str) -> str:
-    return "\n".join(prefix + line if line else line for line in code.split("\n"))
+    """Indent every line of ``code``, except the insides of multiline strings.
+
+    The cell is indented so it can sit inside the async wrapper. A multiline
+    string's continuation lines are data, not code: prefixing them changes the
+    value the cell produces. ``tokenize`` says which lines those are, so a
+    triple-quoted literal keeps exactly the content the caller wrote.
+
+    Falls back to a plain indent when the source does not tokenize (incomplete
+    input, for instance); the caller reports the resulting error itself.
+    """
+    lines = code.split("\n")
+    try:
+        string_ranges: set[int] = set()
+        fstring_middle_type = getattr(tokenize, "FSTRING_MIDDLE", None)
+        for token in tokenize.generate_tokens(io.StringIO(code).readline):
+            if token.type == tokenize.STRING or (
+                fstring_middle_type and token.type == fstring_middle_type
+            ):
+                start_line = token.start[0] - 1
+                end_line = token.end[0] - 1
+                if end_line > start_line:
+                    # Continuation lines only: the opening line is still code.
+                    string_ranges.update(range(start_line + 1, end_line + 1))
+    except (tokenize.TokenError, IndentationError):
+        return "\n".join(prefix + line if line else line for line in lines)
+
+    return "\n".join(
+        line if idx in string_ranges or not line else prefix + line
+        for idx, line in enumerate(lines)
+    )
 
 
 async def run_cell_source(
