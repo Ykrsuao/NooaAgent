@@ -111,18 +111,44 @@ def _indent(code: str, prefix: str) -> str:
 _NEVER_GLOBAL = frozenset({"self", "asyncio", "__builtins__"})
 
 
-def _global_declarations(bindings: Mapping[str, Any]) -> tuple[str, ...]:
-    """Public, non-callable names a cell may rebind and expect to persist.
+def _assigned_names(tree: ast.Module) -> set[str]:
+    """Names this cell binds at module level, excluding nested scopes.
 
-    A name only needs ``global`` when the cell assigns it; declaring every data
-    name is what lets ``x = x + 5`` read the previous value instead of raising
-    ``UnboundLocalError``. Callables and modules are excluded because they are
-    re-imported or redefined rather than accumulated.
+    A name needs ``global`` only when the cell *assigns* it: that is what makes
+    ``x = x + 5`` read the previous value instead of raising UnboundLocalError.
+    Scanning the cell — rather than the namespace — keeps the declaration list
+    proportional to what the cell touches. Declaring every name in the namespace
+    instead would make the wrapper's ``finally`` capture the agent module's
+    entire global scope into ``captured_locals`` on every cell.
     """
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            found.add(node.id)
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            found.add(node.target.id)
+        elif isinstance(node, ast.Global):
+            found.update(node.names)
+    return found
+
+
+def _global_declarations(tree: ast.Module, bindings: Mapping[str, Any]) -> tuple[str, ...]:
+    """Names to declare ``global`` in the wrapper.
+
+    Intersection of two sets: what the cell assigns, and what the namespace
+    already holds as plain data. Both halves earn their place — the first keeps
+    the list small, the second avoids declaring a name the cell would then have
+    to create from nothing.
+
+    Callables and modules are excluded: they are re-imported or redefined rather
+    than accumulated, and capturing them would put functions into session state.
+    """
+    assigned = _assigned_names(tree)
     return tuple(
         name
         for name, value in sorted(bindings.items())
-        if not name.startswith("_")
+        if name in assigned
+        and not name.startswith("_")
         and name not in _NEVER_GLOBAL
         and not callable(value)
         and not isinstance(value, types.ModuleType)
@@ -301,7 +327,7 @@ def prepare_cell(
             code = "\n".join(lines)
             implicit_return_added = True
 
-    global_names = _global_declarations(existing_bindings or {})
+    global_names = _global_declarations(tree, existing_bindings or {})
     global_decl = f"    global {', '.join(global_names)}\n" if global_names else ""
     header = f"async def __repl_wrapper__():\n{global_decl}    try:\n"
     line_offset = header.count("\n")

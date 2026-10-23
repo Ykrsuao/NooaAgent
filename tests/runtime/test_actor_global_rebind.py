@@ -68,6 +68,39 @@ async def test_rebinding_a_module_list_mutates_it_in_place():
 MODULE_LIST = [1, 2]
 
 
+MODULE_BIG = list(range(1000))
+"""Module-level data the cell below never touches."""
+
+
+@pytest.mark.asyncio
+async def test_untouched_module_names_are_not_captured():
+    """Only names the cell assigns may be declared global.
+
+    The wrapper's ``finally`` captures every ``global`` name into
+    ``captured_locals``, and strategies fold that into the session. Declaring
+    the whole namespace therefore copied the agent module's entire global scope
+    into session state on every cell — a leak that grew with the cell count.
+    """
+    runtime = ActorRuntime(_ModuleConstAgent())
+    result = await runtime.execute_code("1 + 1", wrap_in_function=True, validate=False)
+
+    assert result.error is None
+    assert "MODULE_BIG" not in result.captured_locals
+    assert "MODULE_CONST" not in result.captured_locals
+
+
+@pytest.mark.asyncio
+async def test_assigned_module_names_are_still_captured():
+    """The control: a name the cell does assign is captured, so rebinds persist."""
+    runtime = ActorRuntime(_ModuleConstAgent())
+    result = await runtime.execute_code(
+        "MODULE_CONST = MODULE_CONST + 1", wrap_in_function=True, validate=False
+    )
+
+    assert result.error is None
+    assert result.captured_locals["MODULE_CONST"] == 101
+
+
 @pytest.mark.asyncio
 async def test_callable_module_names_are_not_declared_global():
     """Helpers and imported callables stay ordinary names; only data is rebound."""
