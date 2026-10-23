@@ -13,8 +13,8 @@ from pydantic import BaseModel
 from nooa.config.truncation_config import DEFAULT_TRUNCATION_CONFIG
 from nooa.errors.formatting import format_error_for_llm
 from nooa.events import _NO_RETURN, ExecutionResult, ExecutionSignal
-from nooa.runtime.sandbox import wire
 from nooa.runtime.cell_core import run_cell_source
+from nooa.runtime.sandbox import wire
 from nooa.runtime.sandbox.errors import (
     CellMemoryError,
     CellSerializationError,

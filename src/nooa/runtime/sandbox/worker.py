@@ -24,8 +24,8 @@ from multiprocessing.connection import Connection
 from typing import Any, cast
 
 from nooa.errors.formatting import IPythonErrorFormatter
-from nooa.runtime.sandbox import wire
 from nooa.runtime.cell_core import run_cell_source
+from nooa.runtime.sandbox import wire
 from nooa.runtime.sandbox.serialization import ResultDTO, dto_to_wire, result_to_dto
 
 # Private state (the broker, and thus the parent pipe) for every proxy handed to

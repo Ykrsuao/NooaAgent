@@ -12,7 +12,6 @@ import linecache
 import logging
 import math
 import re as _re
-import tokenize
 import types
 import warnings
 from collections.abc import Callable
@@ -1683,8 +1682,6 @@ class ActorRuntime:
             # compiled runtime tracebacks.
             cell_filename = f"Cell In[{execution_count}]"
 
-            # Parse AST to find method definitions
-            source_code = code
             try:
                 tree = ast.parse(code, filename=cell_filename)
             except SyntaxError as e:
@@ -1702,34 +1699,12 @@ class ActorRuntime:
 
             # Check for explicit return BEFORE any transformation
             # Use a NodeVisitor that doesn't recurse into nested functions/classes
-            # to avoid false positives from returns in nested definitions
+            # to avoid false positives from returns in nested definitions.
+            # The wrapped path recomputes this inside prepare_cell; the unwrapped
+            # path below still needs it here. The implicit-return rewrite itself
+            # exists only in prepare_cell — the unwrapped path never had it.
             has_explicit_return = _has_top_level_return(tree)
-
-            # Transform last expression to implicit return (REPL/Jupyter style)
-            # This allows `doc(self)` or `result` at the end to return their values
-            # IMPORTANT: We modify the code TEXT directly instead of using ast.unparse()
-            # because ast.unparse() removes comments and changes line numbers, which
-            # breaks error line number reporting for users.
             implicit_return_added = False
-            if wrap_in_function and tree.body and not has_explicit_return:
-                last_stmt = tree.body[-1]
-                if isinstance(last_stmt, ast.Expr):
-                    # Get the line number of the last expression
-                    last_line_no = last_stmt.lineno
-                    code_lines = code.split("\n")
-                    if 1 <= last_line_no <= len(code_lines):
-                        # Insert 'return ' at the statement's COLUMN (not the line
-                        # start): a ';'-compound final line must keep its earlier
-                        # statements live — line-prefixing made them dead code.
-                        # This preserves comments and line structure.
-                        original_line = code_lines[last_line_no - 1]
-                        col = last_stmt.col_offset
-                        code_lines[last_line_no - 1] = (
-                            f"{original_line[:col]}return {original_line[col:]}"
-                        )
-                        code = "\n".join(code_lines)
-                        implicit_return_added = True
-                        get_harness_metrics().implicit_return()
 
             returned_value = _NO_RETURN
             captured_locals: dict[str, Any] = {}
@@ -1737,84 +1712,46 @@ class ActorRuntime:
 
             try:
                 if wrap_in_function:
-                    # REPL mode: wrap entire code in async function to capture return
-                    # Use try/finally to capture locals regardless of how function exits
-                    indented = self._indent_code(code, "        ")
-                    # Initialize the captured locals dict in exec_globals
-                    exec_globals["__repl_captured_locals__"] = {}
-
-                    # Build global declarations for session variables (REPL persistence)
-                    # This allows code like `x = x + 5` to work when x was defined in a prior call
-                    # Without this, Python sees `x = ...` and marks x as local, failing on the RHS
-                    #
-                    # Both sources matter. ``builtins`` carries the session variables
-                    # a strategy re-injects between cells; ``exec_globals`` already
-                    # holds the agent module's own module-level names. Only listing
-                    # the first meant `MODULE_CONST = MODULE_CONST + 1` raised
-                    # UnboundLocalError in process while the sandbox backend — which
-                    # declares every non-callable namespace name — ran it fine.
-                    global_vars = [
-                        name
-                        for name, val in {**exec_globals, **(builtins or {})}.items()
-                        if (
-                            not name.startswith("_")
-                            and name not in ("self", "asyncio", "__builtins__")
-                            and not callable(val)
-                            and not isinstance(val, types.ModuleType)
-                        )
-                    ]
-                    global_decl = f"    global {', '.join(global_vars)}\n" if global_vars else ""
-
-                    # Build the set of global var names for the finally block
-                    global_var_set = set(global_vars)
-
-                    # Calculate wrapper header line count for error line adjustment
-                    # User code starts after: "async def __repl_wrapper__():\n" + global_decl + "    try:\n"
-                    wrapper_header = f"async def __repl_wrapper__():\n{global_decl}    try:\n"
-                    wrapper_line_offset = wrapper_header.count("\n")
-
-                    wrapper = f"""async def __repl_wrapper__():
-{global_decl}    try:
-{indented}
-    finally:
-        # Capture locals for REPL persistence (exclude internals and builtins)
-        # Also capture updated global variables that were declared global
-        __repl_captured_locals__.update({{
-            k: v for k, v in locals().items()
-            if not k.startswith('_') and k not in ('self', 'asyncio')
-        }})
-        # Capture updated values of global variables we declared
-        for _gvar in {repr(global_var_set)}:
-            if _gvar in globals():
-                __repl_captured_locals__[_gvar] = globals()[_gvar]
-"""
-                    # Register wrapper with linecache so traceback can show source lines
-                    linecache.cache[cell_filename] = (
-                        len(wrapper),
-                        None,
-                        wrapper.splitlines(keepends=True),
-                        cell_filename,
-                    )
-
-                    exec(compile(wrapper, cell_filename, "exec"), exec_globals)
-                    # Execute with async safety (blocks Future.result() etc from event loop)
+                    # REPL mode. The wrapper, the implicit-return rewrite and the
+                    # global declarations live in nooa.runtime.cell_core, shared
+                    # with the sandbox worker so the two cannot drift. What stays
+                    # here is what is genuinely in-process: contextvar-backed
+                    # stream capture, async-safety patching, and the timeout.
                     from nooa.runtime.async_safety import agent_async_safety_context
+                    from nooa.runtime.cell_core import prepare_cell
 
-                    coro = exec_globals["__repl_wrapper__"]()
-                    with agent_async_safety_context():
-                        if timeout is not None:
-                            try:
-                                result_value = await asyncio.wait_for(coro, timeout=timeout)
-                            except TimeoutError:
-                                raise TimeoutError(
-                                    f"Code execution timed out after {timeout} seconds. "
-                                    "Check for infinite loops or blocking operations."
-                                ) from None
-                        else:
-                            result_value = await coro
+                    prepared = prepare_cell(
+                        code,
+                        execution_count=execution_count,
+                        existing_bindings={**exec_globals, **(builtins or {})},
+                    )
+                    wrapper_line_offset = prepared.line_offset
+                    has_explicit_return = prepared.has_explicit_return
+                    implicit_return_added = prepared.implicit_return_added
+                    if implicit_return_added:
+                        get_harness_metrics().implicit_return()
 
-                    # Extract captured locals (filter out non-serializable/internal items)
-                    captured_locals = _extract_captured_locals(exec_globals)
+                    # The wrapper's finally block writes here; it must exist
+                    # before the cell runs so a raise cannot leave it unbound.
+                    exec_globals["__repl_captured_locals__"] = {}
+                    try:
+                        coro = prepared.run(exec_globals)
+                        with agent_async_safety_context():
+                            if timeout is not None:
+                                try:
+                                    result_value = await asyncio.wait_for(coro, timeout=timeout)
+                                except TimeoutError:
+                                    raise TimeoutError(
+                                        f"Code execution timed out after {timeout} seconds. "
+                                        "Check for infinite loops or blocking operations."
+                                    ) from None
+                            else:
+                                result_value = await coro
+                    finally:
+                        # Keep REPL state even when the cell raises or is cancelled.
+                        persisted = prepared.persist(exec_globals)
+                    captured_locals = persisted.captured_locals
+                    defined_methods = persisted.defined_methods
 
                     # Capture return value based on return type:
                     # - Explicit return: always capture (even None)
@@ -1824,42 +1761,6 @@ class ActorRuntime:
                     elif implicit_return_added and result_value is not None:
                         # Suppress None from implicit returns (matches IPython behavior)
                         returned_value = result_value
-
-                    # Still extract method definitions for helper functions
-                    # Re-execute just the function defs to bind them
-                    func_defs: list[ast.stmt] = [
-                        n
-                        for n in tree.body
-                        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
-                    ]
-                    if func_defs:
-                        func_tree = ast.Module(body=func_defs, type_ignores=[])
-                        exec(compile(func_tree, cell_filename, "exec"), exec_globals)
-                        # Persisted helpers are compiled directly from the cell
-                        # AST, not through the async wrapper. Keep their source
-                        # cache aligned with those original line numbers.
-                        linecache.cache[cell_filename] = (
-                            len(source_code),
-                            None,
-                            source_code.splitlines(keepends=True),
-                            cell_filename,
-                        )
-                        # The wrapper's finally block captured the wrapped
-                        # function objects. Persist the direct-compiled versions
-                        # instead so later calls use source-relative line numbers.
-                        for node in func_defs:
-                            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                                if node.name in exec_globals:
-                                    captured_locals[node.name] = exec_globals[node.name]
-
-                    # Attach source code to defined functions for has_ellipsis_body() detection
-                    for method_name, method_code in method_sources.items():
-                        if method_name in exec_globals and callable(exec_globals[method_name]):
-                            try:
-                                exec_globals[method_name]._generated_source = method_code
-                            except (AttributeError, TypeError):
-                                # Some built-in functions don't allow attribute assignment
-                                pass
                 else:
                     # Original mode: separate function defs from other statements
                     func_defs = [
@@ -3113,48 +3014,6 @@ class ActorRuntime:
             # Restore previous context variable value
             # (handles nested generation sessions correctly)
             _in_generation_session.set(prev_in_session)
-
-    def _indent_code(self, code: str, indent: str) -> str:
-        """Indent each line of code, preserving multiline string indentation."""
-        lines = code.split("\n")
-        try:
-            # Tokenize to find string literals
-            tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
-
-            # Track which lines are continuation lines of multiline strings
-            # Uses 0-indexed line numbers to match enumerate(lines)
-            string_ranges = set()
-            fstring_middle_type = getattr(tokenize, "FSTRING_MIDDLE", None)
-
-            for token in tokens:
-                # Check for STRING tokens or FSTRING_MIDDLE (Python 3.12+)
-                if token.type == tokenize.STRING or (
-                    fstring_middle_type and token.type == fstring_middle_type
-                ):
-                    # Convert 1-based tokenizer positions to 0-indexed
-                    start_line = token.start[0] - 1
-                    end_line = token.end[0] - 1
-
-                    # Check if this token spans multiple lines
-                    if end_line > start_line:
-                        # Mark continuation lines (not the first line, but include the last)
-                        for line_idx in range(start_line + 1, end_line + 1):
-                            string_ranges.add(line_idx)
-
-            # Indent normal lines, preserve string continuation lines
-            result_lines = []
-            for idx, line in enumerate(lines):
-                if idx in string_ranges:
-                    # String continuation - keep as-is
-                    result_lines.append(line)
-                else:
-                    # Normal code - add indent
-                    result_lines.append(indent + line)
-
-            return "\n".join(result_lines)
-        except (tokenize.TokenError, IndentationError):
-            # Fallback to simple indentation if tokenization fails
-            return "\n".join(indent + line for line in lines)
 
     async def _prepare_context(
         self,

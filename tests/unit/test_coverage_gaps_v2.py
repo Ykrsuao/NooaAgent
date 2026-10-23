@@ -266,42 +266,6 @@ class TestActorExpandVariables:
         assert "{x!r:.2f}" in result
 
 
-class TestActorIndentCode:
-    """_indent_code() with multi-line strings (lines 2000-2001, 2008) and tokenization error (2014-2016)."""
-
-    def _make_runtime(self):
-        from nooa.agent import Agent
-
-        llm = FakeLLMClient()
-
-        class _A(Agent, llm=llm):
-            async def run(self) -> str:
-                """Run."""
-                ...
-
-        return _A().runtime
-
-    def test_indent_code_with_multiline_string(self):
-        runtime = self._make_runtime()
-        code = 'x = """line1\nline2\nline3"""'
-        indented = runtime._indent_code(code, "    ")
-        # First line gets indented
-        assert indented.split("\n")[0].startswith("    ")
-        # String continuation lines preserved
-        assert "line2" in indented
-        assert "line3" in indented
-
-    def test_indent_code_tokenization_fallback(self):
-        """Lines 2014-2016: tokenization fails → simple indentation."""
-        runtime = self._make_runtime()
-        # Malformed code that triggers tokenize.TokenError
-        bad_code = "x = '''\nunclosed triple"
-        # Should not raise; falls back to simple indentation
-        result = runtime._indent_code(bad_code, "    ")
-        assert isinstance(result, str)
-        assert "    " in result
-
-
 class TestActorGenerate:
     """generate() raises RuntimeError when called without context (lines 380, 392)."""
 
