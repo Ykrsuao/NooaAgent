@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Sandbox cells preserve REPL state across recoverable exits."""
+"""A cell preserves REPL state across recoverable exits."""
 
 from __future__ import annotations
 
 import pytest
 
 from nooa.events import ExecutionSignal
-from nooa.runtime.sandbox.cell_core import run_cell_source
+from nooa.runtime.cell_core import run_cell_source
 
 
 @pytest.mark.asyncio

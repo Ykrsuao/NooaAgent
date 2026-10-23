@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The sandbox cell engine's implicit-return rewrite must not drop statements.
+"""The cell engine's implicit-return rewrite must not drop statements.
 
 ``run_cell_source`` prepends ``return `` to the last top-level expression so a
 cell's final value is returned (Jupyter semantics). It prepended at the start of
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from nooa.runtime.sandbox.cell_core import run_cell_source
+from nooa.runtime.cell_core import run_cell_source
 
 
 @pytest.mark.asyncio
@@ -67,4 +67,47 @@ async def test_multiline_trailing_call_still_works():
     code = "total([\n    1,\n    2,\n])"
     result = await run_cell_source(code, ns)
     assert result.error is None
+    assert result.returned_value == 3
+
+
+# --- the wrapper indent must not rewrite string contents ----------------------
+# The cell is indented into the async wrapper, but a multiline string's
+# continuation lines are DATA, not code. Indenting them changes the value the
+# cell produces, so the sandbox backend disagreed with the in-process one for
+# every triple-quoted literal.
+
+
+@pytest.mark.asyncio
+async def test_multiline_string_value_is_unchanged():
+    ns: dict = {}
+    code = 's = """\nhello\n"""\nreturn s'
+    result = await run_cell_source(code, ns)
+    assert result.error is None, f"cell errored: {result.error}"
+    assert result.returned_value == "\nhello\n"
+
+
+@pytest.mark.asyncio
+async def test_multiline_string_as_last_expression_is_unchanged():
+    ns: dict = {}
+    code = 's = """\nhello\n"""\ns'
+    result = await run_cell_source(code, ns)
+    assert result.error is None, f"cell errored: {result.error}"
+    assert result.returned_value == "\nhello\n"
+
+
+@pytest.mark.asyncio
+async def test_multiline_fstring_keeps_its_own_indentation():
+    ns: dict = {"name": "x"}
+    code = 'msg = f"""\n{name}\n"""\nreturn msg'
+    result = await run_cell_source(code, ns)
+    assert result.error is None, f"cell errored: {result.error}"
+    assert result.returned_value == "\nx\n"
+
+
+@pytest.mark.asyncio
+async def test_multiline_string_followed_by_code_still_executes():
+    ns: dict = {}
+    code = 's = """\na\n"""\nns_value = len(s)\nreturn ns_value'
+    result = await run_cell_source(code, ns)
+    assert result.error is None, f"cell errored: {result.error}"
     assert result.returned_value == 3

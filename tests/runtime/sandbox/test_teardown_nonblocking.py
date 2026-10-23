@@ -39,6 +39,27 @@ class _Agent(Agent, llm=FakeLLMClient()):
 _START_METHOD = "spawn" if os.name == "nt" else "fork"
 
 
+def _executor_with_fake_proc() -> tuple[SandboxedExecutor, _SlowProc]:
+    """An executor whose worker is a fake proc and whose backend matches it.
+
+    The backend is installed explicitly rather than inferred from the platform:
+    on Windows ``open_backend`` returns the AppContainer adapter, whose
+    ``release`` requires a real ``ContainerProcess``. What this file tests is
+    the loop-blocking behaviour of teardown, which is the same for every
+    backend, so pinning the process adapter keeps the fake honest.
+    """
+    from nooa.runtime.sandbox.backends import ProcessBackend
+
+    ex = SandboxedExecutor(
+        _Agent(), SandboxConfig(require=False, start_method=_START_METHOD), cell_timeout=10.0
+    )
+    ex._backend = ProcessBackend(_START_METHOD)
+    proc = _SlowProc()
+    ex._proc = proc
+    ex._conn = None
+    return ex, proc
+
+
 class _SlowProc:
     """Stands in for a worker whose reap blocks (ignores the first signal)."""
 
@@ -65,12 +86,7 @@ class _SlowProc:
 
 @pytest.mark.asyncio
 async def test_async_teardown_does_not_block_the_event_loop():
-    ex = SandboxedExecutor(
-        _Agent(), SandboxConfig(require=False, start_method=_START_METHOD), cell_timeout=10.0
-    )
-    proc = _SlowProc()
-    ex._proc = proc  # type: ignore[assignment]
-    ex._conn = None
+    ex, proc = _executor_with_fake_proc()
 
     ticks = 0
 
@@ -100,12 +116,7 @@ async def test_async_teardown_does_not_block_the_event_loop():
 
 def test_sync_terminate_still_available_for_close_sync():
     """The sync path (close_sync) keeps a synchronous _terminate_worker."""
-    ex = SandboxedExecutor(
-        _Agent(), SandboxConfig(require=False, start_method=_START_METHOD), cell_timeout=10.0
-    )
-    proc = _SlowProc()
-    ex._proc = proc  # type: ignore[assignment]
-    ex._conn = None
+    ex, proc = _executor_with_fake_proc()
     ex._terminate_worker()  # must not raise; reaps synchronously
     assert proc.joins >= 1 and not proc.is_alive()
     assert ex._proc is None
