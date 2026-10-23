@@ -26,7 +26,6 @@ from nooa.runtime.sandbox.errors import (
     CellMemoryError,
     CellTimeoutError,
     SandboxUnavailable,
-    WorkerDiedError,
 )
 from nooa.runtime.sandbox.guards import Capabilities
 from nooa.runtime.sandbox.worker import worker_main
@@ -155,17 +154,6 @@ class ContainerBackend:
     def __init__(self, config: Any, runtime_root: Any):
         self._config = config
         self._runtime_root = runtime_root
-        self._summary = ""
-
-    @property
-    def runtime_summary(self) -> str:
-        """What the last runtime-root preparation reported.
-
-        Carried into startup failures: the worker's own error says what failed
-        inside the sandbox, and this says whether the preconditions (package
-        copy, tokenizer cache) were ever met.
-        """
-        return self._summary
 
     def start(self, init: dict[str, Any]) -> tuple[Any, Connection]:
         from nooa.runtime.sandbox.win_launcher import start_container_worker
@@ -180,8 +168,8 @@ class ContainerBackend:
         # worker imports the agent's module by name, and an agent that lives in
         # a host package (nooa_cli's coding agent, for instance) would otherwise
         # fail with ModuleNotFoundError before its first cell.
-        self._summary = prepare_root(self._runtime_root, sync=True, packages=_workspace_packages())
-        logger.debug("sandbox runtime prepared: %s", self._summary)
+        summary = prepare_root(self._runtime_root, sync=True, packages=_workspace_packages())
+        logger.debug("sandbox runtime prepared: %s", summary)
         try:
             handles = start_container_worker(
                 init,
@@ -195,7 +183,11 @@ class ContainerBackend:
                 env_passthrough=self._config.env_passthrough,
             )
         except SandboxUnavailable as exc:
-            raise SandboxUnavailable(f"{exc} [runtime: {self._summary}]") from exc
+            # The worker's own error says what failed inside the sandbox; the
+            # runtime summary says whether the preconditions (package copy,
+            # tokenizer cache) were ever met. Without both, diagnosing a clean
+            # CI runner means guessing.
+            raise SandboxUnavailable(f"{exc} [runtime: {summary}]") from exc
         return handles.proc, handles.conn
 
     def is_alive(self, proc: Any) -> bool:
@@ -287,8 +279,3 @@ def require_start_method(config: Any) -> None:
             f"Sandbox execution requires the {config.start_method!r} process start method, "
             f"which is unavailable on this platform.{hint}"
         )
-
-
-def classify_unexplained(exc: WorkerDiedError, code: int | None, backend: CellBackend) -> Exception:
-    """The adapter's verdict on an exit code, or the original error."""
-    return backend.classify_death(code) or exc
