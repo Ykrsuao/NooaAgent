@@ -160,16 +160,21 @@ def test_sandbox_requires_a_supported_process_start_method(monkeypatch, require)
         executor.SandboxedExecutor(None, SandboxConfig(require=require), cell_timeout=1)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="the structure is only used on Windows")
 def test_job_object_limit_layout_matches_the_windows_abi():
-    """The kernel reads whatever bytes it is given, so the layout is pinned."""
+    """The kernel reads whatever bytes it is given, so the layout is pinned.
+
+    Windows-only: ``wintypes.DWORD`` is ``c_ulong``, which is 8 bytes on LP64
+    Linux, so the same definition measures differently there. The size that
+    matters is the one this platform passes to ``SetInformationJobObject``.
+    """
     import ctypes
 
     from nooa._win_job import BasicLimit, ExtendedLimit, IoCounters
 
-    pointer = ctypes.sizeof(ctypes.c_void_p)
     assert ctypes.sizeof(IoCounters) == 48
-    assert ctypes.sizeof(BasicLimit) == (64 if pointer == 8 else 48)
-    assert ctypes.sizeof(ExtendedLimit) == (144 if pointer == 8 else 112)
+    assert ctypes.sizeof(BasicLimit) == (64 if ctypes.sizeof(ctypes.c_void_p) == 8 else 48)
+    assert ctypes.sizeof(ExtendedLimit) == (144 if ctypes.sizeof(ctypes.c_void_p) == 8 else 112)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the Job Object wrappers bind kernel32")
