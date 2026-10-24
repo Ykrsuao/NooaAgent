@@ -39,16 +39,10 @@ logger = logging.getLogger(__name__)
 
 
 def _shell_environment() -> dict[str, str]:
-    """The host's environment, minus credentials this process loaded itself.
+    """The host's environment, minus credentials this process loaded itself."""
+    from nooa.secrets import environment_without_loaded_secrets
 
-    Same rule as the PowerShell host: names the user exported stay, names
-    ``load_secrets_into_env()`` added at startup do not. A command that can
-    print an env var can send it anywhere.
-    """
-    from nooa.secrets import names_loaded_from_file
-
-    loaded = names_loaded_from_file()
-    env = {key: value for key, value in os.environ.items() if key not in loaded}
+    env = environment_without_loaded_secrets()
     env["PS1"] = ""
     env["TERM"] = "dumb"
     return env

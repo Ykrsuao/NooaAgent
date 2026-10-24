@@ -201,3 +201,23 @@ def test_a_lowercase_file_key_is_recorded_as_the_environment_spells_it(
         f"the loader recorded {key!r} but the environment stores {stored!r}; "
         "a shell filtering by the recorded name would keep the credential"
     )
+
+
+def test_child_environment_drops_loaded_names_and_keeps_exported_ones(
+    user_dir, project_dir, monkeypatch
+):
+    """The one filter both shell backends build their environment from."""
+    from nooa.secrets import environment_without_loaded_secrets
+    from nooa.tools import _bash_session, _powershell_session
+
+    monkeypatch.setenv(_KEY2, "exported")
+    _write(user_dir, f"env:\n  {_KEY}: from-file\n")
+    load_secrets_into_env()
+
+    for env in (
+        environment_without_loaded_secrets(),
+        _bash_session._shell_environment(),
+        _powershell_session._shell_environment(),
+    ):
+        assert _KEY not in env
+        assert env[_KEY2] == "exported"
