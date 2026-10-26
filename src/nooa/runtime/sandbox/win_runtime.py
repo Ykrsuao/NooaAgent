@@ -638,6 +638,10 @@ def _revoke_entries(entries: list[dict[str, Any]]) -> tuple[list[str], int]:
             sid_text = entry["sid"]
         except (KeyError, TypeError):
             continue
+        # Only AppContainer SIDs are ever journalled. Anything else is a forged
+        # or corrupt record, and revoking it could strip the user's own ACEs.
+        if not isinstance(sid_text, str) or not sid_text.startswith("S-1-15-2-"):
+            continue
         sid = ctypes.c_void_p()
         if not win_api._adv.ConvertStringSidToSidW(sid_text, ctypes.byref(sid)):
             failed += 1

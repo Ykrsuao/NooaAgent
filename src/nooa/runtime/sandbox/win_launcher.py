@@ -266,6 +266,12 @@ class ContainerProcess:
         if self._released:
             return
         self._released = True
+        # Kill the whole job before touching the DACLs: an open handle is not
+        # re-checked after a revoke, so a surviving descendant could keep
+        # writing for as long as a large revoke takes.
+        self._job.terminate(1)
+        if self._child.pi.hProcess is not None:
+            _wait(self._child.pi.hProcess, 2000)
         failed = 0
         try:
             # Recorded when the grants were written, not re-derived from the
@@ -315,29 +321,38 @@ def _reject_nested_root(root: RuntimeRoot, workspace: str | None) -> None:
     root, ``%LOCALAPPDATA%\\nooa\\sandbox-runtime``, is already outside every
     project.
     """
-    if not workspace:
-        return
+    if workspace:
+        _reject_root_under(root, workspace, "the workspace")
+
+
+def _reject_root_under(root: RuntimeRoot, granted: str, what: str) -> None:
+    """Refuse a writable grant that is, or contains, the runtime root.
+
+    The same inheritance as for the workspace applies to every write grant: a
+    writable allow path above the root would let cells rewrite the interpreter
+    and forge the ACL journals that recovery acts on.
+    """
     try:
         root_path = root.root.resolve()
-        workspace_path = Path(workspace).resolve()
+        granted_path = Path(granted).resolve()
     except OSError as exc:
         # Fail closed. This check is the only thing standing between a root
-        # inside the workspace and a cell that inherits write access to its own
-        # interpreter; "cannot tell" must not read as "nested root is fine".
+        # inside a writable grant and a cell that inherits write access to its
+        # own interpreter; "cannot tell" must not read as "nested root is fine".
         # The comparison below needs resolved paths, so without them the safe
         # answer is to refuse rather than to guess.
         raise SandboxUnavailable(
             f"cannot verify that the sandbox runtime root {root.root} is outside "
-            f"the workspace {workspace}: {exc}. Move the root to a path that "
+            f"{what} {granted}: {exc}. Move the root to a path that "
             "resolves on this machine — the default is "
             "%LOCALAPPDATA%\\nooa\\sandbox-runtime."
         ) from exc
-    if root_path == workspace_path or workspace_path in root_path.parents:
+    if root_path == granted_path or granted_path in root_path.parents:
         raise SandboxUnavailable(
-            f"the sandbox runtime root {root_path} is inside the workspace "
-            f"{workspace_path}. The workspace grant would be inherited by the "
+            f"the sandbox runtime root {root_path} is inside {what} "
+            f"{granted_path}. Its write grant would be inherited by the "
             "root, letting cells rewrite the interpreter they run under. Move "
-            "the root outside the workspace — the default is "
+            "the root outside it — the default is "
             "%LOCALAPPDATA%\\nooa\\sandbox-runtime."
         )
 
@@ -379,6 +394,9 @@ def start_container_worker(
     from nooa.runtime.sandbox.win_api import create_profile
 
     _reject_nested_root(root, workspace)
+    for rule in spec.path_grants:
+        if rule.required and rule.write:
+            _reject_root_under(root, rule.path, "the writable allow path")
 
     # One profile per session: the name determines the SID, and a shared SID
     # means one session's teardown revokes the other's grants.
@@ -402,6 +420,7 @@ def start_container_worker(
             "SandboxConfig.container_name must be unique among concurrent sessions"
         ) from None
     granted: list[str] = []
+    released = False
 
     def grant_path(path: str, access: int) -> None:
         if not os.path.exists(path):
@@ -483,12 +502,6 @@ def start_container_worker(
 
         parent_conn, child_conn = mp.Pipe(duplex=True)
         handle = child_conn.fileno()
-        # HANDLE_LIST accepts inheritable handles only; a non-inheritable one
-        # makes CreateProcessW fail with ERROR_INVALID_PARAMETER (87).
-        if not _k32.SetHandleInformation(
-            ctypes.c_void_p(handle), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT
-        ):
-            raise SandboxUnavailable("could not mark the broker pipe inheritable")
 
         argv = [
             str(root.python),
@@ -509,23 +522,46 @@ def start_container_worker(
                     os.remove(_crash_log_path(workspace))
                 except OSError:
                     pass
-            child = _spawn(
-                argv,
-                name,
-                handle,
-                workspace or str(root.root),
-                env=child_env,
-                # network=False is the absence of capability SIDs; network=True
-                # has to grant one, or the container still has no network.
-                capabilities=() if spec.block_network else ("internetClient",),
-            )
+            # HANDLE_LIST accepts inheritable handles only; a non-inheritable
+            # one makes CreateProcessW fail with ERROR_INVALID_PARAMETER (87).
+            # The flag is held for the creation call alone: while it is set, any
+            # other thread that creates a process inheriting *all* handles
+            # (os.system, close_fds=False) would receive the broker pipe.
+            if not _k32.SetHandleInformation(
+                ctypes.c_void_p(handle), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT
+            ):
+                raise SandboxUnavailable("could not mark the broker pipe inheritable")
+            try:
+                child = _spawn(
+                    argv,
+                    name,
+                    handle,
+                    workspace or str(root.root),
+                    env=child_env,
+                    # network=False is the absence of capability SIDs;
+                    # network=True has to grant one, or the container still has
+                    # no network.
+                    capabilities=() if spec.block_network else ("internetClient",),
+                )
+            finally:
+                _k32.SetHandleInformation(ctypes.c_void_p(handle), HANDLE_FLAG_INHERIT, 0)
         except BaseException:
             parent_conn.close()
             child_conn.close()
             job.close()
             raise
-        job.assign(child.pi.hProcess)
-        child.resume()
+        try:
+            job.assign(child.pi.hProcess)
+            child.resume()
+        except BaseException:
+            # Still suspended or outside the job: KILL_ON_JOB_CLOSE cannot be
+            # relied on, so end the process explicitly before closing handles.
+            _k32.TerminateProcess(child.pi.hProcess, 1)
+            child.close()
+            job.close()
+            parent_conn.close()
+            child_conn.close()
+            raise
         child_conn.close()
 
         proc = ContainerProcess(child, job, journal, granted, name, sid_text)
@@ -534,11 +570,16 @@ def start_container_worker(
         except BaseException:
             proc.terminate()
             proc.join(timeout=2.0)
+            # release() already revoked, cleared the journal and deleted the
+            # profile; the outer handler must not repeat any of it.
+            released = True
             proc.release()
             parent_conn.close()
             raise
         return ContainerHandles(proc=proc, conn=parent_conn)
     except BaseException:
+        if released:
+            raise
         # Any failure before the process is handed to the caller must not leak
         # ACEs: they are persistent, and a retry would otherwise stack them.
         failed = 0

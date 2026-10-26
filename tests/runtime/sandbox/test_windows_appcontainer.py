@@ -783,6 +783,48 @@ def test_starting_a_session_with_a_nested_root_is_refused(tmp_path, monkeypatch)
         start_container_worker({}, spec, RuntimeRoot(nested), workspace=str(workspace))
 
 
+def test_a_writable_allow_path_above_the_root_is_refused(tmp_path):
+    """Every write grant is inheritable, not only the workspace's.
+
+    A read-write allow path containing the runtime root would let cells rewrite
+    the interpreter and forge the ACL journals that recovery revokes from.
+    """
+    from dataclasses import replace
+
+    from nooa.runtime.sandbox.config import PathGrant, resolve_spec
+    from nooa.runtime.sandbox.win_launcher import SandboxUnavailable, start_container_worker
+    from nooa.runtime.sandbox.win_runtime import RuntimeRoot
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    shared = tmp_path / "shared"
+    root = shared / "rt"
+    root.mkdir(parents=True)
+    (root / "python.exe").write_bytes(b"")
+
+    spec = resolve_spec(_config(workspace))
+    spec = replace(
+        spec,
+        path_grants=(*spec.path_grants, PathGrant(path=str(shared), write=True, required=True)),
+    )
+    with pytest.raises(SandboxUnavailable, match="inside the writable allow path"):
+        start_container_worker({}, spec, RuntimeRoot(root), workspace=str(workspace))
+
+
+def test_recovery_ignores_non_appcontainer_sids(tmp_path, monkeypatch):
+    """A forged journal must not make recovery revoke the user's own ACEs."""
+    from nooa.runtime.sandbox import win_api
+    from nooa.runtime.sandbox.win_runtime import _revoke_entries
+
+    target = tmp_path / "victim"
+    target.mkdir()
+    calls = []
+    monkeypatch.setattr(win_api, "revoke", lambda path, sid: calls.append(path))
+
+    revoked, failed = _revoke_entries([{"path": str(target), "sid": "S-1-5-32-545"}])
+    assert (revoked, failed, calls) == ([], 0, [])
+
+
 def test_an_unresolvable_workspace_is_refused_rather_than_skipped(tmp_path, monkeypatch):
     """``_reject_nested_root`` must fail closed when it cannot resolve a path.
 
