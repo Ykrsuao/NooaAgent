@@ -11,15 +11,17 @@ whatever guards remain, and serves the op loop.
 Ordering inside the container matters:
 
 1. reconstruct the pipe connection from the inherited handle;
-2. verify we really are in a container (a launch outside one means the
-   launcher's confinement silently did not apply — refuse to run);
-3. tell the parent the baseline memory, so it can translate the configured
-   headroom into an absolute Job Object ceiling;
-4. build the namespace and serve.
+2. verify we really are in a container, under the expected container SID (a
+   launch outside one means the launcher's confinement silently did not
+   apply — refuse to run);
+3. build the namespace;
+4. tell the parent the baseline memory, so it can translate the configured
+   headroom into an absolute Job Object ceiling, then serve.
 
-Step 3 happens before the namespace build on purpose: the baseline must describe
-the *bare interpreter*, so that importing the agent module and its dependencies
-counts against the cell's budget rather than against the baseline.
+Step 4 happens after the namespace build on purpose: the headroom is relative
+to a worker that is ready to run cells — the same baseline the Linux backend
+inherits through ``fork``. The consequence is that importing the agent module
+and building the namespace run before any memory or CPU limit is set.
 """
 
 from __future__ import annotations
@@ -211,7 +213,13 @@ def _run(handle: int, expected_container: str | None, crash_path: str | None = N
     from multiprocessing.connection import PipeConnection
 
     from nooa.runtime.sandbox import wire
-    from nooa.runtime.sandbox.win_api import app_container_sid, is_app_container
+    from nooa.runtime.sandbox.win_api import (
+        _k32,
+        app_container_sid,
+        container_sid,
+        is_app_container,
+        sid_string,
+    )
 
     try:
         conn = PipeConnection(handle, readable=True, writable=True)
@@ -231,6 +239,17 @@ def _run(handle: int, expected_container: str | None, crash_path: str | None = N
         if expected_container and actual is None:
             _send_fatal(conn, wire, "container SID is unreadable")
             return 4
+        if expected_container:
+            # The name fixes the SID, so a mismatch means this worker is running
+            # under some other container's identity and grants.
+            expected_sid = container_sid(expected_container)
+            try:
+                expected = sid_string(expected_sid)
+            finally:
+                _k32.LocalFree(expected_sid)
+            if actual != expected:
+                _send_fatal(conn, wire, f"running as container {actual}, expected {expected}")
+                return 4
     except OSError as exc:
         _send_fatal(conn, wire, f"token query failed: {exc}")
         return 4

@@ -45,6 +45,8 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 WAIT_TIMEOUT = 0x00000102
 WAIT_OBJECT_0 = 0x00000000
 INFINITE = 0xFFFFFFFF
+WAIT_FAILED = 0xFFFFFFFF
+SDDL_REVISION_1 = 1
 STILL_ACTIVE = 259
 ERROR_ACCESS_DENIED = 5
 
@@ -61,6 +63,7 @@ HANDLE_FLAG_INHERIT = 0x00000001
 TOKEN_QUERY = 0x0008
 TokenIsAppContainer = 29
 TokenAppContainerSid = 31
+TokenUser = 1
 
 # --- security ---------------------------------------------------------------
 SE_FILE_OBJECT = 1
@@ -320,6 +323,13 @@ _adv.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.
 _adv.ConvertStringSidToSidW.restype = wintypes.BOOL
 _adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
 _adv.ConvertSidToStringSidW.restype = wintypes.BOOL
+_adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(wintypes.ULONG),
+]
+_adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
 _adv.SetEntriesInAclW.argtypes = [
     wintypes.ULONG,
     ctypes.POINTER(_ExplicitAccessW),
@@ -496,8 +506,11 @@ def _dacl_mutex() -> int | None:
     with _DACL_MUTEX_GUARD:
         if _DACL_MUTEX is not None:
             return _DACL_MUTEX
+        attributes = _mutex_attributes()
         for name in (_DACL_MUTEX_NAME, _DACL_MUTEX_LOCAL_NAME):
-            handle = _k32.CreateMutexW(None, False, name)
+            handle = _k32.CreateMutexW(
+                ctypes.byref(attributes) if attributes is not None else None, False, name
+            )
             if handle:
                 _DACL_MUTEX = handle
                 globals()["_DACL_MUTEX_USED"] = name
@@ -511,11 +524,68 @@ def _dacl_mutex() -> int | None:
         return None
 
 
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [
+        ("nLength", wintypes.DWORD),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", wintypes.BOOL),
+    ]
+
+
+def _current_user_sid() -> str:
+    token = wintypes.HANDLE()
+    if not _adv.OpenProcessToken(_k32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+        raise _err()
+    try:
+        # TOKEN_USER is a SID_AND_ATTRIBUTES followed by the SID it points to.
+        buffer = ctypes.create_string_buffer(256)
+        needed = wintypes.DWORD()
+        if not _adv.GetTokenInformation(
+            token, TokenUser, buffer, ctypes.sizeof(buffer), ctypes.byref(needed)
+        ):
+            raise _err()
+        return sid_string(ctypes.c_void_p.from_buffer(buffer).value)
+    finally:
+        _k32.CloseHandle(token)
+
+
+def _mutex_attributes() -> _SecurityAttributes | None:
+    """A descriptor every process of this user can open, elevated or not.
+
+    The default DACL of an elevated token names Administrators, not the user,
+    and its object is labelled High: a non-elevated editor is then refused,
+    falls through to ``Local\\`` and takes a different mutex — so the two edit
+    the same DACL unserialised. Granting the user SID and lowering the label to
+    Medium makes whichever process creates it first create a shared one.
+    ``None`` (the default descriptor) if it cannot be built.
+    """
+    try:
+        sddl = f"D:(A;;GA;;;{_current_user_sid()})(A;;GA;;;SY)S:(ML;;NW;;;ME)"
+    except OSError:
+        return None
+    descriptor = ctypes.c_void_p()
+    if not _adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None
+    ):
+        return None
+    # Deliberately not freed: the mutex is created once per process and the
+    # descriptor is a few dozen bytes.
+    return _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
+
+
+def _acquire(mutex: int) -> None:
+    # WAIT_ABANDONED still hands over ownership; only WAIT_FAILED does not, and
+    # carrying on then would be exactly the unserialised edit the lock exists
+    # to prevent.
+    if _k32.WaitForSingleObject(mutex, INFINITE) == WAIT_FAILED:
+        raise _err()
+
+
 def _set_entry(path: str, sid: ctypes.c_void_p, access: int, mode: int, inheritance: int) -> None:
     with _DACL_LOCK:
         mutex = _dacl_mutex()
         if mutex:
-            _k32.WaitForSingleObject(mutex, INFINITE)
+            _acquire(mutex)
             try:
                 _set_entry_locked(path, sid, access, mode, inheritance)
             finally:
@@ -828,10 +898,13 @@ def spawn_in_container(
         if not ok:
             raise _err()
         # Keep the SID arrays alive until CreateProcessW has consumed them.
-        _ = handle_array, cap_sids, app_sid
+        _ = handle_array, cap_array
         return Child(info, command.value)
     finally:
         _k32.DeleteProcThreadAttributeList(buffer)
+        # Both come back LocalAlloc'd; CreateProcessW copies them into the token.
+        for sid in (app_sid, *cap_sids):
+            _k32.LocalFree(sid)
 
 
 def _command_line(argv: list[str]) -> str:

@@ -41,7 +41,7 @@ from nooa.runtime.sandbox.serialization import (
     effective_error_limit,
     is_picklable,
 )
-from nooa.runtime.sandbox.worker import worker_main
+from nooa.runtime.sandbox.worker import _is_async_callable, worker_main
 
 logger = logging.getLogger(__name__)
 
@@ -673,7 +673,7 @@ class SandboxedExecutor:
                 is_callable = callable(target) and not isinstance(target, type)
                 flags = {
                     "callable": is_callable,
-                    "is_async": is_callable and asyncio.iscoroutinefunction(target),
+                    "is_async": is_callable and _is_async_callable(target),
                 }
                 # The worker turns a callable into a broker callable before it
                 # looks at ``result``, so shipping the callable itself would be
