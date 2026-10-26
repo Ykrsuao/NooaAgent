@@ -11,6 +11,7 @@ rerunning init_command. Completed background trees survive this recovery.
 from __future__ import annotations
 
 import asyncio
+import base64
 import codecs
 import json
 import logging
@@ -213,6 +214,11 @@ def _handoff_output(proc: asyncio.subprocess.Process) -> None:
     finally:
         for handle in duplicates:
             _winapi.CloseHandle(handle)
+
+
+def _b64(text: str) -> str:
+    """UTF-8 base64 of ``text``, for request fields the host must not reparse."""
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
 def _close_expired_transport(transport: asyncio.BaseTransport) -> None:
@@ -481,11 +487,12 @@ class PowerShellSession:
             input_path = Path(name)
             with os.fdopen(fd, "wb") as output:
                 output.write(stdin.encode("utf-8"))
+        # Text fields travel base64-encoded; the host explains why.
         request = {
             "id": request_id,
-            "command": command,
-            "stdin_path": str(input_path) if input_path is not None else None,
-            "cwd": str(cwd) if cwd is not None else None,
+            "command": _b64(command),
+            "stdin_path": _b64(str(input_path)) if input_path is not None else None,
+            "cwd": _b64(str(cwd)) if cwd is not None else None,
         }
         queue: asyncio.Queue[tuple[str, str | _Completion | Exception]] = asyncio.Queue(maxsize=32)
         marker = f"\x1eNOOA_{request_id}\x1f".encode("ascii")
@@ -565,8 +572,11 @@ class PowerShellSession:
                                 "PowerShell control response did not match the command"
                             )
                         result = _Completion(int(reply["code"]))
-                        if reply.get("cwd"):
-                            self._cwd = Path(reply["cwd"])
+                        # Registry/Env: and other providers report non-filesystem
+                        # locations; keep the last real directory instead.
+                        cwd = Path(reply.get("cwd") or "")
+                        if cwd.is_absolute():
+                            self._cwd = cwd
                         self._remember_background()
                     else:
                         # A socket reset can precede the process-exit callback.

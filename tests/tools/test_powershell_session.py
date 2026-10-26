@@ -225,6 +225,17 @@ async def test_large_outputs_are_drained_and_bounded(session):
     assert (await session.run("Write-Output clean")) == ("clean", "", 0)
 
 
+async def test_date_like_text_is_not_reparsed_as_a_date(session):
+    """PowerShell 7's ConvertFrom-Json turns ISO-8601 strings into DateTime.
+
+    Before the request fields were base64-encoded, a command that was exactly
+    such a string reached the host as a localized "01/01/2024 00:00:00".
+    """
+    _stdout, stderr, code = await session.run("2024-01-01T00:00:00")
+    assert code != 0
+    assert "2024-01-01T00:00:00" in stderr
+
+
 async def test_concurrent_calls_are_serialized(session):
     await session.run("$counter = 0")
     results = await asyncio.gather(

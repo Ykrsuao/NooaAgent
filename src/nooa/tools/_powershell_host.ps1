@@ -46,6 +46,15 @@ public static class NooaStandardInput {
 
 while ($null -ne ($__nooa_line = $__nooa_reader.ReadLine())) {
     $__nooa_request = $__nooa_line | ConvertFrom-Json
+    # The text fields arrive base64-encoded: PowerShell 7's ConvertFrom-Json
+    # turns any ISO-8601-looking string into a DateTime, so a cwd or command of
+    # "2024-01-01T00:00:00" came back as a localized date. Base64 never matches.
+    foreach ($__nooa_field in 'command', 'cwd', 'stdin_path') {
+        if ($null -ne $__nooa_request.$__nooa_field) {
+            $__nooa_request.$__nooa_field = $__nooa_utf8.GetString(
+                [Convert]::FromBase64String($__nooa_request.$__nooa_field))
+        }
+    }
     $__nooa_code = 0
     $__nooa_back = Get-Location
     $__nooa_input_file = $null
