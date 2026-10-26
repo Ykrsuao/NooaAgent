@@ -6,6 +6,13 @@ to follow semantic versioning.
 
 ## [Unreleased]
 
+- Shell commands (`ShellTools`, Bash and PowerShell sessions) no longer see
+  the variables `load_secrets_into_env()` loaded from `secrets.yaml`; variables
+  the user exported in the environment are still passed through. A command that
+  can print a variable can send it anywhere. A script that relied on a key
+  from `secrets.yaml` now has to receive it explicitly, e.g. by exporting it
+  before starting the process.
+
 - `RetryConfig` is the only endpoint retry budget for `CompletionClient` on
   OpenAI-compatible routes. LiteLLM let the OpenAI SDK retry each attempt twice
   more, so `RetryConfig(max_retries=2)` sent 9 requests for a persistent server
