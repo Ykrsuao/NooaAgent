@@ -74,7 +74,8 @@ async def test_powershell_result_and_language_are_visible(tmp_path):
     try:
         result = await shell.run("Write-Error 'problem'")
         assert result.shell == "powershell" and not result.success
-        assert "PowerShellOutput" in repr(result) and "problem" in result.stderr
+        assert f"returncode={result.returncode}" in repr(result)
+        assert result.returncode != 0 and "problem" in result.stderr
         assert "powershell" in doc(shell).lower()
         # PowerShell variables and quoting must never go through the Bash
         # search parser, even if the output resembles an editable anchor.
