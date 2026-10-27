@@ -22,6 +22,8 @@ from nooa_cli.sessions.events import (
     SESSION_EVENT_TYPES,
     SessionStarted,
     SessionTitleUpdated,
+    SessionToolCard,
+    SessionTurnEnded,
     SessionUserMessage,
 )
 
@@ -32,6 +34,42 @@ _TITLE_EVENT_TYPES = frozenset(("SessionTitleUpdated", "TUISessionRename"))
 _USER_EVENT_TYPES = frozenset(("SessionUserMessage", "TUIUserInput"))
 _AGENT_EVENT_TYPES = frozenset(("AgentMessage", "TUIAgentMessage"))
 _TURN_EVENT_TYPES = _USER_EVENT_TYPES | _AGENT_EVENT_TYPES
+# A replayed Out[n] is for orientation; the full value is in the agent's context.
+_MAX_VALUE_CHARS = 10_000
+
+
+def _is_visible_cell(raw: dict[str, object]) -> bool:
+    """Same filter as the live ACP cards: real Python cells only.
+
+    Prefill cells and codeact's synthetic prose carriers never ran user-visible
+    code, so they are not shown live and must not appear on replay either.
+    """
+    if raw.get("name") not in {"execute_python", "python_cell"}:
+        return False
+    metadata = raw.get("metadata")
+    if not isinstance(metadata, dict):
+        return True
+    return metadata.get("prefill") is not True and metadata.get("synthetic") is not True
+
+
+def _cell(call_id: str, code: str, output: dict[str, object] | None) -> SessionCell:
+    if output is None:
+        return SessionCell(call_id, code, None, "interrupted")
+    parts = [
+        str(output.get(key) or "").rstrip()
+        for key in ("stdout", "stderr", "error")
+        if str(output.get(key) or "").strip()
+    ]
+    value = output.get("value")
+    if value is not None:
+        parts.append(f"Out[{output.get('execution_count', '?')}]: {str(value)[:_MAX_VALUE_CHARS]}")
+    text = "\n".join(parts)
+    status = output.get("execution_status")
+    if status == "cancelled":
+        return SessionCell(call_id, code, text or None, "interrupted")
+    if status == "error":
+        return SessionCell(call_id, code, text or "Failed.", "failed")
+    return SessionCell(call_id, code, text or "Completed.", "completed")
 
 
 class InvalidSessionIdError(ValueError):
@@ -63,6 +101,54 @@ class SessionTurn:
     role: Literal["user", "agent"]
     content: str
     timestamp: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCell:
+    """A Python cell the agent ran, read back from the durable event log.
+
+    ``output`` is ``None`` when no result was recorded: the cell was still
+    running when the process stopped. A cancelled cell keeps what it printed.
+    """
+
+    tool_call_id: str
+    code: str
+    output: str | None
+    status: Literal["completed", "failed", "interrupted"]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCard:
+    """A file-edit or terminal card recorded as the live client received it.
+
+    ``card`` is the serialized ACP tool-call start. A command records its card
+    when it starts and again when it finishes; the later one wins.
+    """
+
+    tool_call_id: str
+    card: dict[str, object]
+
+
+ReplayItem = SessionTurn | SessionCell | SessionCard
+
+
+@dataclass(frozen=True, slots=True)
+class SessionReplay:
+    """A session read back in one pass, in the order it was recorded.
+
+    ``items`` is the conversation with the cards that ran between its
+    messages. ``interrupted_from`` is the index of the last user message when
+    the process stopped during that turn, else ``None``.
+    """
+
+    items: list[ReplayItem]
+    interrupted_from: int | None = None
+
+    def interrupted_turn(self) -> list[ReplayItem] | None:
+        """What the interrupted turn recorded after its user message, if any."""
+        if self.interrupted_from is None:
+            return None
+        return self.items[self.interrupted_from + 1 :]
 
 
 class SessionHandle:
@@ -124,10 +210,16 @@ class SessionHandle:
                 last_active=event.timestamp.timestamp(),
             )
 
-    def record_user_message(self, content: str) -> tuple[str, SessionUserMessage]:
-        """Persist raw user text before dispatching its agent turn."""
+    def record_user_message(
+        self, content: str, *, tracks_end: bool = False
+    ) -> tuple[str, SessionUserMessage]:
+        """Persist raw user text before dispatching its agent turn.
+
+        ``tracks_end`` promises a :meth:`record_turn_end` once the turn is
+        handled; only then can a missing marker be read as an interruption.
+        """
         self._ensure_open()
-        event = SessionUserMessage(content=content)
+        event = SessionUserMessage(content=content, tracks_end=tracks_end)
         tag = self._events.add(event)
         with self._metadata_lock:
             self._info = replace(
@@ -137,8 +229,21 @@ class SessionHandle:
             )
         return tag, event
 
+    def record_turn_end(self) -> None:
+        """Mark the latest user message as handled, whatever the outcome."""
+        self._ensure_open()
+        self._events.add(SessionTurnEnded())
+
     def turns(self) -> list[SessionTurn]:
         return self._store.load_turns(self.id)
+
+    def replay(self) -> SessionReplay:
+        return self._store.load_replay(self.id)
+
+    def record_tool_card(self, tool_call_id: str, card: dict[str, object]) -> None:
+        """Keep a file-edit or terminal card as it was sent, for replay."""
+        self._ensure_open()
+        self._events.add(SessionToolCard(tool_call_id=tool_call_id, card=card))
 
     def close(self) -> None:
         if self._closed:
@@ -250,25 +355,99 @@ class SessionStore:
     def load_turns(self, session_id: str) -> list[SessionTurn]:
         path = self.path_for(session_id)
         rows = self._read_rows(path, event_types=_TURN_EVENT_TYPES)
-        turns: list[SessionTurn] = []
-        for event_type, raw in rows:
-            try:
-                if event_type in _USER_EVENT_TYPES:
-                    content = raw.get("content", raw.get("text", ""))
-                    role: Literal["user", "agent"] = "user"
+        return [turn for row in rows if (turn := self._turn(*row, path)) is not None]
+
+    def load_replay(self, session_id: str) -> SessionReplay:
+        """Read the conversation, its cards and the last turn's state at once.
+
+        A Python cell takes the place of its call, since its result arrives
+        later; a recorded card takes its own. Anything before the first user
+        message belongs to no turn and is left out.
+
+        Only a user message recorded with ``tracks_end`` can be judged
+        interrupted: its host writes ``SessionTurnEnded`` on every outcome it
+        survives — reply, cancel, error — so the marker is missing only when
+        the process itself went away.
+        """
+        path = self.path_for(session_id)
+        items: list[ReplayItem | None] = []
+        cells: dict[str, tuple[int, str]] = {}
+        cards: dict[str, int] = {}
+        outputs: dict[str, dict[str, object]] = {}
+        last_user: int | None = None
+        tracked = False
+        for event_type, raw in self._read_rows(path):
+            if event_type in _TURN_EVENT_TYPES:
+                turn = self._turn(event_type, raw, path)
+                if turn is None:
+                    continue
+                if turn.role == "user":
+                    last_user = len(items)
+                    tracked = event_type == "SessionUserMessage" and raw.get("tracks_end") is True
+                items.append(turn)
+                continue
+            if last_user is None:
+                continue
+            if event_type == "SessionTurnEnded":
+                tracked = False
+                continue
+            call_id = raw.get("tool_call_id")
+            if not isinstance(call_id, str):
+                continue
+            if event_type == "SessionToolCard":
+                card = raw.get("card")
+                if not isinstance(card, dict):
+                    continue
+                if call_id in cards:
+                    items[cards[call_id]] = SessionCard(call_id, card)
                 else:
-                    content = raw.get("content", "")
-                    role = "agent"
-                turns.append(
-                    SessionTurn(
-                        role=role,
-                        content=str(content),
-                        timestamp=self._timestamp(raw, fallback=time.time()),
-                    )
-                )
-            except Exception:
-                logger.debug("Skipping invalid turn in %s", path, exc_info=True)
-        return turns
+                    cards[call_id] = len(items)
+                    items.append(SessionCard(call_id, card))
+            elif event_type == "ToolCallEvent" and _is_visible_cell(raw):
+                arguments = raw.get("arguments")
+                code = arguments.get("code", "") if isinstance(arguments, dict) else ""
+                code = code if isinstance(code, str) else repr(code)
+                if call_id in cells:
+                    cells[call_id] = (cells[call_id][0], code)
+                else:
+                    cells[call_id] = (len(items), code)
+                    items.append(None)
+            elif event_type == "PythonOutput":
+                outputs[call_id] = raw
+        for call_id, (index, code) in cells.items():
+            items[index] = _cell(call_id, code, outputs.get(call_id))
+        return SessionReplay(
+            [item for item in items if item is not None],
+            last_user if tracked else None,
+        )
+
+    def load_interrupted_cells(self, session_id: str) -> list[SessionCell] | None:
+        """The cells of the last turn if the process stopped during it, else ``None``.
+
+        An empty list means it stopped before running any Python.
+        """
+        turn = self.load_replay(session_id).interrupted_turn()
+        if turn is None:
+            return None
+        return [item for item in turn if isinstance(item, SessionCell)]
+
+    @staticmethod
+    def _turn(event_type: str, raw: dict[str, object], path: Path) -> SessionTurn | None:
+        try:
+            if event_type in _USER_EVENT_TYPES:
+                content = raw.get("content", raw.get("text", ""))
+                role: Literal["user", "agent"] = "user"
+            else:
+                content = raw.get("content", "")
+                role = "agent"
+            return SessionTurn(
+                role=role,
+                content=str(content),
+                timestamp=SessionStore._timestamp(raw, fallback=time.time()),
+            )
+        except Exception:
+            logger.debug("Skipping invalid turn in %s", path, exc_info=True)
+            return None
 
     def find_by_prefix(self, prefix: str) -> list[str]:
         if not prefix or any(separator in prefix for separator in ("/", "\\", "\x00")):

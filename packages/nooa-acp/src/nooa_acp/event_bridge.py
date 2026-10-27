@@ -58,7 +58,7 @@ def _fenced_code(text: str, language: str) -> str:
     return f"{fence}{language}\n{text}\n{fence}"
 
 
-def _python_content(code: str, output: str | None = None) -> list[ContentToolCallContent]:
+def python_content(code: str, output: str | None = None) -> list[ContentToolCallContent]:
     """Render Python source and output as Markdown visible in ACP clients."""
     content = [tool_content(text_block(_fenced_code(code, "python")))]
     if output is not None:
@@ -70,6 +70,7 @@ def _python_content(code: str, output: str | None = None) -> list[ContentToolCal
 class _TerminalCard:
     command: str
     language: str
+    working_directory: str = ""
     stdout: str = ""
     stderr: str = ""
     output_truncated: bool = False
@@ -88,10 +89,19 @@ class _TerminalCard:
 
 
 class ACPEventBridge:
-    def __init__(self, agent: CodingAgent, client: Client, session_id: str) -> None:
+    def __init__(
+        self,
+        agent: CodingAgent,
+        client: Client,
+        session_id: str,
+        record_card: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         self.agent = agent
         self.client = client
         self.session_id = session_id
+        # File-edit and terminal activity is runtime-only, so a reload can only
+        # show these cards if the host keeps them as they were sent.
+        self._record_card = record_card
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._error: Exception | None = None
         # Set when the pump exits on a BaseException it cannot handle. Nothing
@@ -120,6 +130,17 @@ class ACPEventBridge:
     def _enqueue(self, update: Any) -> None:
         if not self._closed:
             self._queue.put_nowait(update)
+
+    def _keep_card(self, card: Any) -> None:
+        if self._record_card is None:
+            return
+        try:
+            self._record_card(
+                card.tool_call_id, card.model_dump(mode="json", by_alias=True, exclude_none=True)
+            )
+        except Exception:
+            # A lost card only hides it on reload; the live card already went out.
+            logger.debug("Could not record a tool card", exc_info=True)
 
     def publish(self, update: Any) -> None:
         """Queue a host-originated session update on the ordered ACP stream."""
@@ -160,7 +181,7 @@ class ACPEventBridge:
                 # structured Markdown content, not a client-owned terminal.
                 kind="other",
                 status="in_progress",
-                content=_python_content(code),
+                content=python_content(code),
             )
         )
 
@@ -198,7 +219,7 @@ class ACPEventBridge:
                 event.tool_call_id,
                 title="Python failed" if status == "failed" else "Ran Python",
                 status=status,
-                content=_python_content(code, output),
+                content=python_content(code, output),
             )
         )
 
@@ -213,41 +234,45 @@ class ACPEventBridge:
         else:
             content = [tool_content(text_block(event.diff or "File content was truncated."))]
         line = max(0, event.start_line - 1) if event.start_line is not None else None
-        self._enqueue(
-            start_tool_call(
-                tool_call_id,
-                title,
-                kind="edit",
-                status="completed",
-                content=content,
-                locations=[ToolCallLocation(path=path, line=line)],
-                raw_input={"path": path, "operation": event.operation},
-            )
+        card = start_tool_call(
+            tool_call_id,
+            title,
+            kind="edit",
+            status="completed",
+            content=content,
+            locations=[ToolCallLocation(path=path, line=line)],
+            raw_input={"path": path, "operation": event.operation},
         )
+        self._enqueue(card)
+        self._keep_card(card)
 
     def _on_terminal_started(self, event: EventBase) -> None:
         if not isinstance(event, TerminalCommandStarted):
             return
         self._open_tools.add(event.command_id)
-        terminal = _TerminalCard(event.command, self.agent.shell.shell)
-        self._terminals[event.command_id] = terminal
-        self._enqueue(
-            start_tool_call(
-                event.command_id,
-                "Running command",
-                # This persistent shell belongs to the agent, so there is no
-                # client-created ACP terminal to reference. Generic content
-                # remains inspectable in clients whose execute view requires
-                # a terminal ID, as it does for our Python tool cards.
-                kind="other",
-                status="in_progress",
-                content=terminal.content(),
-                raw_input={
-                    "command": event.command,
-                    "working_directory": event.working_directory,
-                },
-            )
+        terminal = _TerminalCard(
+            event.command, self.agent.shell.shell, working_directory=event.working_directory
         )
+        self._terminals[event.command_id] = terminal
+        card = start_tool_call(
+            event.command_id,
+            "Running command",
+            # This persistent shell belongs to the agent, so there is no
+            # client-created ACP terminal to reference. Generic content
+            # remains inspectable in clients whose execute view requires
+            # a terminal ID, as it does for our Python tool cards.
+            kind="other",
+            status="in_progress",
+            content=terminal.content(),
+            raw_input={
+                "command": event.command,
+                "working_directory": event.working_directory,
+            },
+        )
+        self._enqueue(card)
+        # Kept now, not only at the finish: a command the process dies in is
+        # the one a reload most needs to show. The finished card replaces it.
+        self._keep_card(card)
 
     def _on_terminal_output(self, event: EventBase) -> None:
         if not isinstance(event, TerminalCommandOutput) or event.command_id not in self._open_tools:
@@ -268,7 +293,8 @@ class ACPEventBridge:
         if not isinstance(event, TerminalCommandFinished):
             return
         self._open_tools.discard(event.command_id)
-        terminal = self._terminals.pop(event.command_id, _TerminalCard("", "text"))
+        started = self._terminals.pop(event.command_id, None)
+        terminal = started or _TerminalCard("", "text")
         terminal.output_truncated |= event.output_truncated
         failed = (
             event.timed_out
@@ -293,17 +319,37 @@ class ACPEventBridge:
         else:
             notes.append(f"Exit code: {event.exit_code}")
             title += f" (exit {event.exit_code})"
+        status: Literal["failed", "completed"] = "failed" if failed else "completed"
+        content = terminal.content("\n\n".join(notes))
+        raw_output = {
+            "exit_code": event.exit_code,
+            "timed_out": event.timed_out,
+            "output_truncated": terminal.output_truncated,
+        }
         self._enqueue(
             update_tool_call(
                 event.command_id,
                 title=title,
-                status="failed" if failed else "completed",
-                content=terminal.content("\n\n".join(notes)),
-                raw_output={
-                    "exit_code": event.exit_code,
-                    "timed_out": event.timed_out,
-                    "output_truncated": terminal.output_truncated,
+                status=status,
+                content=content,
+                raw_output=raw_output,
+            )
+        )
+        if started is None:
+            # No start was seen, so there is no command to show on reload.
+            return
+        self._keep_card(
+            start_tool_call(
+                event.command_id,
+                title,
+                kind="other",
+                status=status,
+                content=content,
+                raw_input={
+                    "command": terminal.command,
+                    "working_directory": terminal.working_directory,
                 },
+                raw_output=raw_output,
             )
         )
 
@@ -424,7 +470,7 @@ class ACPEventBridge:
             partial = self._cancelled_output.pop(tool_call_id, None)
             if code is not None:
                 output = f"{partial}\n\n{reason}" if partial else reason
-                content = _python_content(code, output)
+                content = python_content(code, output)
             elif terminal is not None:
                 content = terminal.content(f"{reason}\n\nExit code: unavailable")
             else:

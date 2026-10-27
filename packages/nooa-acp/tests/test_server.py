@@ -1572,3 +1572,313 @@ async def test_bootstrap_updates_do_not_interleave_into_a_replay(tmp_path):
     # The replayed turns must be contiguous — nothing wedged between them.
     assert replayed == list(range(replayed[0], replayed[0] + len(replayed))), kinds
     await adapter.close()
+
+
+def _replayed_cards(updates: list[object]) -> list[tuple[str, str]]:
+    from acp.schema import ToolCallStart
+
+    return [(u.title, u.status) for u in updates if isinstance(u, ToolCallStart)]
+
+
+def _replayed_agent_text(updates: list[object]) -> str:
+    return "".join(u.content.text for u in updates if isinstance(u, AgentMessageChunk))
+
+
+async def test_every_handled_turn_records_its_end(tmp_path):
+    """Reply and error alike: only a killed process leaves no marker."""
+    import json
+    import sqlite3
+
+    from nooa_cli.sessions import SessionStore
+
+    store = SessionStore(tmp_path / ".nooa" / "sessions")
+
+    def markers(session_id: str) -> list[tuple[str, bool]]:
+        connection = sqlite3.connect(store.path_for(session_id))
+        try:
+            rows = connection.execute(
+                "SELECT event_type, data FROM events WHERE event_type IN "
+                "('SessionUserMessage', 'SessionTurnEnded') ORDER BY insertion_order"
+            ).fetchall()
+        finally:
+            connection.close()
+        return [(kind, json.loads(data).get("tracks_end") is True) for kind, data in rows]
+
+    adapter = CodingACPAdapter(_completed_llm)
+    adapter.on_connect(_RecordingClient())  # type: ignore[arg-type]
+    created = await adapter.new_session(str(tmp_path))
+    await adapter.prompt(created.session_id, [text_block("first")])
+
+    session = await _session(adapter, created.session_id)
+    with patch.object(session.dispatcher, "submit", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            await adapter.prompt(created.session_id, [text_block("second")])
+    assert markers(created.session_id) == [
+        ("SessionUserMessage", True),
+        ("SessionTurnEnded", False),
+        ("SessionUserMessage", True),
+        ("SessionTurnEnded", False),
+    ]
+    assert store.load_interrupted_cells(created.session_id) is None
+    await adapter.close()
+
+
+async def test_replay_shows_the_cells_of_an_interrupted_turn(tmp_path):
+    from nooa_cli.sessions import SessionStore
+
+    from nooa.context_blocks.events import ResultStatus
+    from nooa.events import PythonOutput
+
+    adapter = CodingACPAdapter(_completed_llm)
+    adapter.on_connect(_RecordingClient())  # type: ignore[arg-type]
+    created = await adapter.new_session(str(tmp_path))
+    await adapter.close()
+
+    # What a process killed mid-turn leaves behind: a tracked message, one
+    # finished cell and one that never reported, and no end marker.
+    store = SessionStore(tmp_path / ".nooa" / "sessions")
+    handle = store.open(created.session_id)
+    handle.record_user_message("make two files", tracks_end=True)
+    for call_id, code in (("one", "write_file('a.txt')"), ("two", "run('sleep 10')")):
+        handle.events.add(
+            ToolCallEvent(tool_call_id=call_id, name="execute_python", arguments={"code": code})
+        )
+    handle.events.add(
+        PythonOutput(
+            tool_call_id="one",
+            execution_status=ResultStatus.COMPLETE,
+            execution_count=1,
+            stdout="Created a.txt",
+        )
+    )
+    handle.close()
+
+    client = _RecordingClient()
+    replay = CodingACPAdapter(_completed_llm)
+    replay.on_connect(client)  # type: ignore[arg-type]
+    await replay.load_session(str(tmp_path), created.session_id)
+
+    assert _replayed_cards(client.updates) == [
+        ("Ran Python", "completed"),
+        ("Python interrupted", "failed"),
+    ]
+    notice = _replayed_agent_text(client.updates)
+    assert "previous turn was interrupted" in notice
+    assert "last step's result is unknown" in notice
+
+    # The notice is for the person only: it must not become part of the
+    # durable transcript the agent reads back.
+    assert "interrupted" not in " ".join(
+        turn.content for turn in store.load_turns(created.session_id)
+    )
+    await replay.close()
+
+
+async def test_replay_of_a_finished_session_has_no_interruption_notice(tmp_path):
+    adapter = CodingACPAdapter(_completed_llm)
+    adapter.on_connect(_RecordingClient())  # type: ignore[arg-type]
+    created = await adapter.new_session(str(tmp_path))
+    await adapter.prompt(created.session_id, [text_block("finish")])
+    await adapter.close()
+
+    client = _RecordingClient()
+    replay = CodingACPAdapter(_completed_llm)
+    replay.on_connect(client)  # type: ignore[arg-type]
+    await replay.load_session(str(tmp_path), created.session_id)
+    # The finished turn's cells replay as they ended, never as interrupted.
+    assert all(status == "completed" for _title, status in _replayed_cards(client.updates))
+    assert "interrupted" not in _replayed_agent_text(client.updates)
+    await replay.close()
+
+
+async def test_replay_puts_interrupted_cells_back_between_agent_messages(tmp_path):
+    from acp.schema import ToolCallStart
+    from nooa_cli.sessions import SessionStore
+
+    from nooa.context_blocks.events import ResultStatus
+    from nooa.events import PythonOutput
+    from nooa.interactive import AgentMessage
+
+    adapter = CodingACPAdapter(_completed_llm)
+    adapter.on_connect(_RecordingClient())  # type: ignore[arg-type]
+    created = await adapter.new_session(str(tmp_path))
+    await adapter.close()
+
+    # Cell, reply, cell, then the process dies.
+    store = SessionStore(tmp_path / ".nooa" / "sessions")
+    handle = store.open(created.session_id)
+    handle.record_user_message("look then fix", tracks_end=True)
+    handle.events.add(
+        ToolCallEvent(tool_call_id="look", name="execute_python", arguments={"code": "ls()"})
+    )
+    handle.events.add(
+        PythonOutput(
+            tool_call_id="look",
+            execution_status=ResultStatus.COMPLETE,
+            execution_count=1,
+            stdout="a.py",
+        )
+    )
+    handle.events.add(AgentMessage(content="Found it, fixing."))
+    handle.events.add(
+        ToolCallEvent(tool_call_id="fix", name="execute_python", arguments={"code": "fix()"})
+    )
+    handle.close()
+
+    client = _RecordingClient()
+    replay = CodingACPAdapter(_completed_llm)
+    replay.on_connect(client)  # type: ignore[arg-type]
+    await replay.load_session(str(tmp_path), created.session_id)
+
+    order = [
+        f"cell:{u.tool_call_id}"
+        if isinstance(u, ToolCallStart)
+        else f"agent:{u.content.text.strip()}"
+        for u in client.updates
+        if isinstance(u, ToolCallStart | AgentMessageChunk)
+    ]
+    assert order[:3] == ["cell:look", "agent:Found it, fixing.", "cell:fix"]
+    assert "previous turn was interrupted" in order[3]
+    await replay.close()
+
+
+async def test_replay_shows_the_cells_of_finished_turns(tmp_path):
+    from acp.schema import ToolCallStart, UserMessageChunk
+    from nooa_cli.sessions import SessionStore
+
+    from nooa.context_blocks.events import ResultStatus
+    from nooa.events import PythonOutput
+    from nooa.interactive import AgentMessage
+
+    adapter = CodingACPAdapter(_completed_llm)
+    adapter.on_connect(_RecordingClient())  # type: ignore[arg-type]
+    created = await adapter.new_session(str(tmp_path))
+    await adapter.close()
+
+    store = SessionStore(tmp_path / ".nooa" / "sessions")
+    handle = store.open(created.session_id)
+    for turn, call_id in (("first", "a"), ("second", "b")):
+        handle.record_user_message(turn, tracks_end=True)
+        handle.events.add(
+            ToolCallEvent(tool_call_id=call_id, name="execute_python", arguments={"code": "x()"})
+        )
+        handle.events.add(
+            PythonOutput(
+                tool_call_id=call_id,
+                execution_status=ResultStatus.COMPLETE,
+                execution_count=1,
+                stdout="ok",
+            )
+        )
+        handle.events.add(AgentMessage(content=f"done {turn}"))
+        handle.record_turn_end()
+    handle.close()
+
+    client = _RecordingClient()
+    replay = CodingACPAdapter(_completed_llm)
+    replay.on_connect(client)  # type: ignore[arg-type]
+    await replay.load_session(str(tmp_path), created.session_id)
+
+    order = [
+        f"cell:{u.tool_call_id}"
+        if isinstance(u, ToolCallStart)
+        else f"{'user' if isinstance(u, UserMessageChunk) else 'agent'}:{u.content.text.strip()}"
+        for u in client.updates
+        if isinstance(u, ToolCallStart | AgentMessageChunk | UserMessageChunk)
+    ]
+    assert order == [
+        "user:first",
+        "cell:a",
+        "agent:done first",
+        "user:second",
+        "cell:b",
+        "agent:done second",
+    ]
+    assert _replayed_cards(client.updates) == [("Ran Python", "completed")] * 2
+    await replay.close()
+
+
+async def test_replay_shows_file_edit_and_terminal_cards_as_they_were_sent(tmp_path):
+    from acp.schema import ToolCallStart
+    from nooa_cli.coding.activity import (
+        FileEdit,
+        TerminalCommandFinished,
+        TerminalCommandOutput,
+        TerminalCommandStarted,
+    )
+
+    adapter = CodingACPAdapter(_completed_llm)
+    adapter.on_connect(_RecordingClient())  # type: ignore[arg-type]
+    created = await adapter.new_session(str(tmp_path))
+    session = await _session(adapter, created.session_id)
+    session.handle.record_user_message("edit and test", tracks_end=True)
+    events = session.agent.event_manager
+    events.add(
+        FileEdit(
+            path=str(tmp_path / "a.py"),
+            operation="update",
+            old_text="old\n",
+            new_text="new\n",
+            start_line=1,
+            end_line=1,
+        )
+    )
+    events.add(
+        TerminalCommandStarted(
+            command_id="cmd-1", command="pytest -q", working_directory=str(tmp_path)
+        )
+    )
+    events.add(TerminalCommandOutput(command_id="cmd-1", stdout="2 passed\n"))
+    events.add(TerminalCommandFinished(command_id="cmd-1", exit_code=0))
+    session.handle.record_turn_end()
+    await session.bridge.flush()
+    await adapter.close()
+
+    client = _RecordingClient()
+    replay = CodingACPAdapter(_completed_llm)
+    replay.on_connect(client)  # type: ignore[arg-type]
+    await replay.load_session(str(tmp_path), created.session_id)
+
+    cards = [u for u in client.updates if isinstance(u, ToolCallStart)]
+    assert [(c.kind, c.title, c.status) for c in cards] == [
+        ("edit", "Edited a.py", "completed"),
+        ("other", "Ran command (exit 0)", "completed"),
+    ]
+    assert cards[0].content[0].new_text == "new\n"
+    terminal_text = cards[1].content[0].content.text
+    assert "pytest -q" in terminal_text and "2 passed" in terminal_text
+    assert cards[1].raw_input == {"command": "pytest -q", "working_directory": str(tmp_path)}
+    await replay.close()
+
+
+async def test_replay_shows_a_command_the_process_died_in(tmp_path):
+    from acp.schema import ToolCallStart
+    from nooa_cli.coding.activity import TerminalCommandFinished, TerminalCommandStarted
+
+    adapter = CodingACPAdapter(_completed_llm)
+    adapter.on_connect(_RecordingClient())  # type: ignore[arg-type]
+    created = await adapter.new_session(str(tmp_path))
+    session = await _session(adapter, created.session_id)
+    session.handle.record_user_message("run the slow tests", tracks_end=True)
+    events = session.agent.event_manager
+    events.add(
+        TerminalCommandStarted(command_id="slow", command="pytest", working_directory=str(tmp_path))
+    )
+    # A finish with no start seen must not leave an empty card behind.
+    events.add(TerminalCommandFinished(command_id="stray", exit_code=0))
+    await session.bridge.flush()
+    # The process dies here: no finish for "slow", no turn-end marker.
+    await adapter.close()
+
+    client = _RecordingClient()
+    replay = CodingACPAdapter(_completed_llm)
+    replay.on_connect(client)  # type: ignore[arg-type]
+    await replay.load_session(str(tmp_path), created.session_id)
+
+    cards = [u for u in client.updates if isinstance(u, ToolCallStart)]
+    assert [(c.tool_call_id, c.title, c.status) for c in cards] == [
+        ("slow", "Command interrupted", "failed")
+    ]
+    assert "agent process stopped" in cards[0].content[-1].content.text
+    assert "last step's result is unknown" in _replayed_agent_text(client.updates)
+    await replay.close()

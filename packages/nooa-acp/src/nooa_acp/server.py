@@ -23,7 +23,9 @@ from acp import (
     PromptResponse,
     RequestError,
     run_agent,
+    start_tool_call,
     text_block,
+    tool_content,
     update_agent_message,
     update_user_message,
 )
@@ -43,6 +45,7 @@ from acp.schema import (
     SessionCloseCapabilities,
     SessionListCapabilities,
     SseMcpServer,
+    ToolCallStart,
     UnstructuredCommandInput,
 )
 from acp.schema import (
@@ -56,10 +59,14 @@ from nooa_cli.coding import (
 )
 from nooa_cli.sessions import (
     InvalidSessionIdError,
+    SessionCard,
+    SessionCell,
     SessionHandle,
     SessionNotFoundError,
     SessionStore,
+    SessionTurn,
 )
+from pydantic import ValidationError
 
 from nooa.errors import GenerationError
 from nooa.mcp import MCPManager, MCPTool
@@ -74,12 +81,18 @@ from nooa_acp._runtime import (
 )
 from nooa_acp._stdio import protocol_stdio
 from nooa_acp.dispatcher import InteractiveSessionDispatcher
-from nooa_acp.event_bridge import ACPEventBridge
+from nooa_acp.event_bridge import ACPEventBridge, python_content
 
 logger = logging.getLogger(__name__)
 
 _SESSION_PAGE_SIZE = 50
 _GENERATION_LIMIT_PREFIX = MAX_ITERATIONS_MESSAGE.partition("{")[0]
+_INTERRUPTED_CELL = "Interrupted: the agent process stopped before this finished."
+_STOPPED_CELL = "Stopped before it finished."
+_INTERRUPTED_TURN_NOTICE = (
+    "The previous turn was interrupted: the agent process stopped before it finished."
+)
+_RESUME_HINT = 'Send a message such as "continue" to pick up from there.'
 
 
 @dataclass(slots=True)
@@ -278,10 +291,12 @@ class CodingACPAdapter:
         del kwargs
         runtime = await self._get_runtime(session_id)
         text = self._prompt_text(prompt)
+        recorded: SessionHandle | None = None
         try:
             async with runtime.turn():
                 session = runtime.value
-                session.handle.record_user_message(text)
+                session.handle.record_user_message(text, tracks_end=True)
+                recorded = session.handle
                 session.cancel_complete.clear()
                 try:
                     if not session.commands_sent_on_prompt:
@@ -379,6 +394,18 @@ class CodingACPAdapter:
             # It is gone as far as the client is concerned, so say so rather
             # than letting this escape as an opaque internal error.
             raise RequestError.resource_not_found(session_id) from None
+        finally:
+            # Every outcome this process survives — reply, cancel, error — ends
+            # the turn here, so on reload only a killed process leaves a tracked
+            # message without its marker. Nothing awaits between the turn's
+            # release and this write, so no later turn can slip in between.
+            if recorded is not None:
+                try:
+                    recorded.record_turn_end()
+                except Exception:
+                    # A lost marker only makes a reload show this turn as
+                    # interrupted; it must not turn a finished prompt into an error.
+                    logger.debug("Could not record the end of a turn", exc_info=True)
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         del kwargs
@@ -434,7 +461,9 @@ class CodingACPAdapter:
                     # instead of failing session/new with an opaque error.
                     registration_warnings.append(f"MCP server {name!r} was not registered: {exc}")
             dispatcher = InteractiveSessionDispatcher(agent, strategy=self._session_strategy(root))
-            bridge = ACPEventBridge(agent, self._client, handle.id)
+            bridge = ACPEventBridge(
+                agent, self._client, handle.id, record_card=handle.record_tool_card
+            )
             commands = CodingSlashCommandRegistry(agent)
             value = _ACPSession(
                 handle,
@@ -586,19 +615,107 @@ class CodingACPAdapter:
     async def _replay_session(self, handle: SessionHandle) -> None:
         if self._client is None:
             return
-        for turn in handle.turns():
+        replay = handle.replay()
+        stopped = replay.interrupted_from
+        for index, item in enumerate(replay.items):
+            if not isinstance(item, SessionTurn):
+                await self._replay_item(
+                    handle, item, process_stopped=stopped is not None and index > stopped
+                )
+                continue
             # Each update is a *chunk*, and ACP has no end-of-message marker —
             # a boundary is implied by a different update type arriving. Two
             # turns from the same speaker in a row therefore land in one bubble.
             # That happens whenever a turn produced no reply, as a cancelled one
             # used to, so several stopped prompts replayed as a single run-on
             # line. Terminate each turn so it keeps its own boundary.
-            content = turn.content if turn.content.endswith("\n") else turn.content + "\n"
+            content = item.content if item.content.endswith("\n") else item.content + "\n"
             block = text_block(content)
             update = (
-                update_user_message(block) if turn.role == "user" else update_agent_message(block)
+                update_user_message(block) if item.role == "user" else update_agent_message(block)
             )
             await self._client.session_update(handle.id, update)
+        interrupted = replay.interrupted_turn()
+        if interrupted is not None:
+            await self._replay_interruption_notice(handle, interrupted)
+
+    async def _replay_item(
+        self, handle: SessionHandle, item: SessionCell | SessionCard, *, process_stopped: bool
+    ) -> None:
+        """Show a card read back from the durable log.
+
+        A file-edit or terminal card goes out as it was sent; a Python cell is
+        rebuilt from its events. Either one left unfinished was cut off by the
+        process dying if it is in the interrupted turn, and otherwise stopped
+        with its turn.
+        """
+        assert self._client is not None
+        reason = _INTERRUPTED_CELL if process_stopped else _STOPPED_CELL
+        if isinstance(item, SessionCard):
+            try:
+                card = ToolCallStart.model_validate(item.card)
+            except ValidationError:
+                logger.debug("Skipping an unreadable tool card", exc_info=True)
+                return
+            if card.status in (None, "pending", "in_progress"):
+                card = card.model_copy(
+                    update={
+                        "title": "Command interrupted",
+                        "status": "failed",
+                        "content": [*(card.content or []), tool_content(text_block(reason))],
+                    }
+                )
+            await self._client.session_update(handle.id, card)
+            return
+        cell = item
+        if cell.status == "interrupted":
+            output = f"{cell.output}\n\n{reason}" if cell.output else reason
+            title = "Python interrupted"
+            status = "failed"
+        else:
+            output = cell.output
+            title = "Python failed" if cell.status == "failed" else "Ran Python"
+            status = cell.status
+        await self._client.session_update(
+            handle.id,
+            start_tool_call(
+                cell.tool_call_id,
+                title,
+                kind="other",
+                status=status,
+                content=python_content(cell.code, output),
+            ),
+        )
+
+    async def _replay_interruption_notice(
+        self, handle: SessionHandle, turn: list[SessionTurn | SessionCell | SessionCard]
+    ) -> None:
+        """Say that the last turn did not finish.
+
+        The notice goes to the client alone: recording it would put a host
+        remark into the agent's context, which already holds the cells and
+        their outputs.
+        """
+        assert self._client is not None
+        notice = [_INTERRUPTED_TURN_NOTICE]
+        unfinished = any(
+            (isinstance(item, SessionCell) and item.status == "interrupted")
+            or (
+                isinstance(item, SessionCard)
+                and item.card.get("status") in (None, "pending", "in_progress")
+            )
+            for item in turn
+        )
+        if not turn:
+            notice.append("Nothing had happened in it yet.")
+        elif unfinished:
+            notice.append("Above is what happened before that; the last step's result is unknown.")
+        else:
+            notice.append("Above is what happened before that.")
+        notice.append(_RESUME_HINT)
+        await self._client.session_update(
+            handle.id, update_agent_message(text_block(" ".join(notice) + "\n"))
+        )
 
     @staticmethod
     def _validate_workspace(cwd: str, additional_directories: list[str] | None) -> Path:

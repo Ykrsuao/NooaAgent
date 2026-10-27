@@ -6,13 +6,18 @@ from nooa_cli.sessions.events import (
     SESSION_EVENT_TYPES,
     SessionStarted,
     SessionTitleUpdated,
+    SessionToolCard,
+    SessionTurnEnded,
     SessionUserMessage,
 )
 from nooa_cli.sessions.store import (
     InvalidSessionIdError,
+    SessionCard,
+    SessionCell,
     SessionHandle,
     SessionInfo,
     SessionNotFoundError,
+    SessionReplay,
     SessionStore,
     SessionTurn,
 )
@@ -20,12 +25,17 @@ from nooa_cli.sessions.store import (
 __all__ = [
     "InvalidSessionIdError",
     "SESSION_EVENT_TYPES",
+    "SessionCard",
+    "SessionCell",
     "SessionHandle",
     "SessionInfo",
     "SessionNotFoundError",
+    "SessionReplay",
     "SessionStarted",
     "SessionStore",
     "SessionTitleUpdated",
+    "SessionToolCard",
     "SessionTurn",
+    "SessionTurnEnded",
     "SessionUserMessage",
 ]
