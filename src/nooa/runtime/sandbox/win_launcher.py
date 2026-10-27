@@ -175,6 +175,74 @@ def _agent_import_roots(init: dict[str, Any]) -> list[str]:
     return roots
 
 
+def _grant_plan(
+    spec: ResolvedSpec,
+    root: RuntimeRoot,
+    workspace: str | None,
+    import_roots: list[str],
+) -> list[tuple[str, int]]:
+    """Every ``(path, access)`` a container start grants, in grant order.
+
+    Each path appears once. Each directory grant rewrites the DACL of the whole
+    tree below it, and the workspace (already a required rule in the spec) used
+    to be granted, and revoked, twice: double the cost on a large checkout. A
+    path reached twice keeps the union of its access.
+    """
+    plan: dict[str, tuple[str, int]] = {}
+    workspace_key = os.path.normcase(os.path.abspath(workspace)) if workspace else None
+
+    def add(path: str, access: int) -> None:
+        key = os.path.normcase(os.path.abspath(path))
+        if key == workspace_key:
+            return  # granted last, below
+        previous = plan.get(key)
+        plan[key] = (previous[0] if previous else path, (previous[1] if previous else 0) | access)
+
+    # 1. The runtime root: read+execute, never write. The worker may import
+    #    from it but must not be able to rewrite its own interpreter's code.
+    add(str(root.root), READ_EXECUTE)
+    # 2. User-requested paths. The interpreter/venv paths in the spec are
+    #    deliberately ignored: on Windows "system paths" means the private
+    #    runtime root granted above, not the parent's interpreter.
+    for rule in spec.path_grants:
+        if not rule.required:
+            continue
+        if not os.path.exists(rule.path):
+            raise SandboxUnavailable(f"sandbox allow path does not exist: {rule.path}")
+        add(rule.path, MODIFY if rule.write else READ_EXECUTE)
+    # 3. Tokenizer data. The container has no network; importing the LLM
+    #    stack makes tiktoken look for cl100k_base and download it when the
+    #    cache is missing. The parent warmed this directory in prepare_root,
+    #    which means the files already exist when the grant is written.
+    #
+    #    Granting the directory alone is not enough: an inheritable ACE is
+    #    not reliably pushed onto pre-existing children, and tiktoken checks
+    #    ``os.path.exists`` — which returns *False* rather than raising when
+    #    stat is denied. The failure is therefore silent and looks like a
+    #    missing cache. Grant the files themselves.
+    tokenizer_cache = root.tokenizer_cache
+    add(str(tokenizer_cache), READ_EXECUTE)
+    if tokenizer_cache.is_dir():
+        for entry in tokenizer_cache.iterdir():
+            if entry.is_file():
+                add(str(entry), READ_EXECUTE)
+    # 4. The agent's own module. The worker imports it by name inside the
+    #    container, which is confined from creation — unlike Linux spawn,
+    #    where that import happens before the guards go on. Without this the
+    #    blueprint fails with "cannot resolve X in 'mymodule'".
+    for import_root in import_roots:
+        add(import_root, READ_EXECUTE)
+    grants = list(plan.values())
+    # 5. The workspace last, so it is revoked first on teardown. MODIFY, not
+    #    FILE_ALL_ACCESS: the latter carries WRITE_DAC, which lets a cell
+    #    grant itself access that survives this session's revoke. MODIFY
+    #    still includes DELETE, so ordinary edits and git work inside the
+    #    workspace; it excludes only the two rights that change the ACL.
+    if workspace:
+        grants.append((str(workspace), MODIFY))
+    return grants
+
+
 def _crash_log_path(workspace: str) -> str:
     """Where the container worker appends a startup traceback.
 
@@ -430,48 +498,9 @@ def start_container_worker(
         journal.record(path, sid_text)
 
     try:
-        # 1. The runtime root: read+execute, never write. The worker may import
-        #    from it but must not be able to rewrite its own interpreter's code.
-        grant_path(str(root.root), READ_EXECUTE)
-        # 2. User-requested paths. The interpreter/venv paths in the spec are
-        #    deliberately ignored: on Windows "system paths" means the private
-        #    runtime root granted above, not the parent's interpreter.
-        for rule in spec.path_grants:
-            if not rule.required:
-                continue
-            if not os.path.exists(rule.path):
-                raise SandboxUnavailable(f"sandbox allow path does not exist: {rule.path}")
-            grant_path(rule.path, MODIFY if rule.write else READ_EXECUTE)
-        # 3. Tokenizer data. The container has no network; importing the LLM
-        #    stack makes tiktoken look for cl100k_base and download it when the
-        #    cache is missing. The parent warmed this directory in prepare_root,
-        #    which means the files already exist when the grant is written.
-        #
-        #    Granting the directory alone is not enough: an inheritable ACE is
-        #    not reliably pushed onto pre-existing children, and tiktoken checks
-        #    ``os.path.exists`` — which returns *False* rather than raising when
-        #    stat is denied. The failure is therefore silent and looks like a
-        #    missing cache. Grant the files themselves.
-        tokenizer_cache = root.tokenizer_cache
-        grant_path(str(tokenizer_cache), READ_EXECUTE)
-        if tokenizer_cache.is_dir():
-            for entry in tokenizer_cache.iterdir():
-                if entry.is_file():
-                    grant_path(str(entry), READ_EXECUTE)
-        # 4. The agent's own module. The worker imports it by name inside the
-        #    container, which is confined from creation — unlike Linux spawn,
-        #    where that import happens before the guards go on. Without this the
-        #    blueprint fails with "cannot resolve X in 'mymodule'".
         import_roots = _agent_import_roots(init)
-        for import_root in import_roots:
-            grant_path(import_root, READ_EXECUTE)
-        # 5. The workspace last, so it is revoked first on teardown. MODIFY, not
-        #    FILE_ALL_ACCESS: the latter carries WRITE_DAC, which lets a cell
-        #    grant itself access that survives this session's revoke. MODIFY
-        #    still includes DELETE, so ordinary edits and git work inside the
-        #    workspace; it excludes only the two rights that change the ACL.
-        if workspace:
-            grant_path(str(workspace), MODIFY)
+        for path, access in _grant_plan(spec, root, workspace, import_roots):
+            grant_path(path, access)
 
         # The child runs with ``-I``, which keeps cwd off sys.path and ignores
         # PYTHONPATH, so the granted roots have to be named explicitly.
@@ -513,7 +542,7 @@ def start_container_worker(
             # Positional from here on: the child indexes them directly, so every
             # slot must be present even when empty.
             str(_crash_log_path(workspace)) if workspace else "",
-            str(tokenizer_cache),
+            str(root.tokenizer_cache),
         ]
         job = Job()
         try:

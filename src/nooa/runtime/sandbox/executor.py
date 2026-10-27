@@ -216,6 +216,12 @@ class SandboxedExecutor:
                     "the AppContainer backend requires start_method='spawn': the launcher "
                     "creates the process itself and cannot inherit live objects"
                 )
+            from nooa.runtime.sandbox.blueprint import BlueprintError
+
+            try:
+                self._blueprint.require_named_module()
+            except BlueprintError as exc:
+                raise SandboxUnavailable(str(exc)) from exc
         self._proc: BaseProcess | None = None
         self._conn: Connection | None = None
         self._lock = asyncio.Lock()
@@ -398,7 +404,25 @@ class SandboxedExecutor:
         if self._config.start_method == "fork":
             self._start_worker()  # fork stays on the loop thread
             return
-        await asyncio.to_thread(self._start_worker)
+        # A cancelled to_thread() keeps running its thread, which then stores
+        # a live worker in self._proc. Leaving now would let aclose() run first
+        # and find nothing to stop: the container, its ACL grants and the
+        # journal lock would outlive the session. Hold the caller's lock until
+        # the start settles, then re-raise, so whoever runs next sees the worker.
+        starting = asyncio.ensure_future(asyncio.to_thread(self._start_worker))
+        try:
+            await asyncio.shield(starting)
+        except asyncio.CancelledError:
+            while not starting.done():
+                try:
+                    await asyncio.shield(starting)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:  # noqa: BLE001 - the cancellation is what propagates
+                    break
+            if not starting.cancelled():
+                starting.exception()  # retrieved: a failed start is moot once cancelled
+            raise
 
     async def _restart_worker(self) -> None:
         await self._aterminate_worker()

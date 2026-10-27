@@ -245,7 +245,7 @@ def _probe_windows(runtime_root: str | None = None) -> Capabilities:
     running; the detail string says so.
     """
     from nooa.runtime.sandbox.errors import SandboxUnavailable
-    from nooa.runtime.sandbox.win_runtime import prepare_root, resolve_root
+    from nooa.runtime.sandbox.win_runtime import resolve_root
 
     detail: dict[str, str] = {}
     try:
@@ -255,7 +255,12 @@ def _probe_windows(runtime_root: str | None = None) -> Capabilities:
 
     try:
         root = resolve_root(runtime_root)
-        prepare_root(root, sync=False)
+        # Validation only. prepare_root() also revokes dead sessions' ACEs and
+        # warms the tokenizer cache in a subprocess that may download; a probe
+        # runs on the caller's event loop (executor construction) and at test
+        # import time, so it must do neither. The container start, which runs
+        # off the loop, prepares the root.
+        root.check()
     except SandboxUnavailable as exc:
         return Capabilities(detail={"reason": str(exc)})
     except Exception as exc:  # noqa: BLE001 - any probe failure is "unavailable"

@@ -519,14 +519,16 @@ class CodingACPAdapter:
             updates["start_method"] = "spawn"
         if updates:
             sandbox = sandbox.model_copy(update=updates)
+        # Derived from the decorated default, not restated: a copied literal
+        # kept only cell_timeout, so any other setting the decorator gained
+        # (restrictions, prefill) would silently differ under --sandbox. The
+        # sandbox turns that same cell_timeout from advisory into a hard kill.
+        decorated = getattr(CodingAgent.handle, "_strategy_override", None)
+        base = getattr(decorated, "config", None)
+        if not isinstance(base, CodeActConfig):
+            base = CodeActConfig()
         return CodeActStrategy(
-            config=CodeActConfig(
-                # Same ceiling the decorated default uses; the sandbox turns it
-                # from advisory into a hard kill.
-                cell_timeout=1800.0,
-                execution_backend="sandbox",
-                sandbox=sandbox,
-            )
+            config=base.model_copy(update={"execution_backend": "sandbox", "sandbox": sandbox})
         )
 
     async def _create_mcp_tools(

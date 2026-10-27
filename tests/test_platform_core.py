@@ -158,3 +158,30 @@ def test_sandbox_requires_a_supported_process_start_method(monkeypatch, require)
     monkeypatch.setattr(executor.mp, "get_all_start_methods", lambda: ["spawn"])
     with pytest.raises(SandboxUnavailable, match="fork"):
         executor.SandboxedExecutor(None, SandboxConfig(require=require), cell_timeout=1)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the structure is only used on Windows")
+def test_job_object_limit_layout_matches_the_windows_abi():
+    """The kernel reads whatever bytes it is given, so the layout is pinned.
+
+    Windows-only: ``wintypes.DWORD`` is ``c_ulong``, which is 8 bytes on LP64
+    Linux, so the same definition measures differently there. The size that
+    matters is the one this platform passes to ``SetInformationJobObject``.
+    """
+    import ctypes
+
+    from nooa._win_job import BasicLimit, ExtendedLimit, IoCounters
+
+    assert ctypes.sizeof(IoCounters) == 48
+    assert ctypes.sizeof(BasicLimit) == (64 if ctypes.sizeof(ctypes.c_void_p) == 8 else 48)
+    assert ctypes.sizeof(ExtendedLimit) == (144 if ctypes.sizeof(ctypes.c_void_p) == 8 else 112)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the Job Object wrappers bind kernel32")
+def test_shell_and_sandbox_jobs_share_one_limit_structure():
+    from nooa import _win_job
+    from nooa.runtime.sandbox import win_api
+    from nooa.tools import _windows_job
+
+    assert win_api._ExtendedLimit is _win_job.ExtendedLimit
+    assert _windows_job.ExtendedLimit is _win_job.ExtendedLimit

@@ -35,6 +35,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _MAX_OUTPUT_CHARS = 30_000
+# Read waits allowed once the host has replied. Each pipe's end marker was
+# flushed before that reply, so only a command that rebound or re-encoded the
+# console writer can leave a pipe without one; this bounds that case.
+_MARKER_GRACE_S = 2.0
+_LOST_MARKER_NOTE = (
+    "[nooa] The command finished, but its output end markers never arrived; it "
+    "probably replaced [Console]::Out or changed [Console]::OutputEncoding. "
+    "PowerShell was restarted in the same directory, so variables and "
+    "functions from earlier commands are gone."
+)
 
 
 def _is_app_execution_alias(path: str | Path) -> bool:
@@ -86,22 +96,10 @@ def _resolve_powershell() -> str | None:
 
 
 def _shell_environment() -> dict[str, str]:
-    """The host's environment, minus credentials this process loaded itself.
+    """The host's environment, minus credentials this process loaded itself."""
+    from nooa.secrets import environment_without_loaded_secrets
 
-    A shell the model can drive must not hold API keys. Names the *user*
-    exported are left alone — the shell is their tool and they asked for them —
-    but names that ``load_secrets_into_env()`` pushed in at startup exist only
-    to configure this process's own LLM client. A command that can print an env
-    var can send it anywhere, and a model that can call ``self.shell.run`` can
-    write that command.
-
-    The value is still reachable where it is needed: the LLM client read it
-    from ``os.environ`` in this process before any shell started.
-    """
-    from nooa.secrets import names_loaded_from_file
-
-    loaded = names_loaded_from_file()
-    env = {key: value for key, value in os.environ.items() if key not in loaded}
+    env = environment_without_loaded_secrets()
     env.update(TERM="dumb", NO_COLOR="1", PYTHONIOENCODING="utf-8")
     return env
 
@@ -496,28 +494,41 @@ class PowerShellSession:
         }
         queue: asyncio.Queue[tuple[str, str | _Completion | Exception]] = asyncio.Queue(maxsize=32)
         marker = f"\x1eNOOA_{request_id}\x1f".encode("ascii")
+        loop = asyncio.get_running_loop()
         host_exited = asyncio.Event()
-        completed = False
+        # Set once no more command output is owed: a reply arrived, the host
+        # died, or the command timed out. Pipes then stop waiting indefinitely.
+        stopping = asyncio.Event()
+        # Pipes whose end marker was seen. Without both, the host's console
+        # output is no longer parseable and the host cannot be reused.
+        marked: set[str] = set()
+        completed = lost_marker = False
 
         async def pump(stream: asyncio.StreamReader, name: str) -> None:
             decoder = codecs.getincrementaldecoder("utf-8")("replace")
             pending = b""
-            exited = asyncio.create_task(host_exited.wait())
+            stopped = asyncio.create_task(stopping.wait())
             reading: asyncio.Task[bytes] | None = None
-            # Once a dead host has no marker (e.g. TerminateProcess), a live
-            # background writer must not hold this command open indefinitely.
-            # This exceeds the bounded reader/OS buffers left by the host.
-            remaining_after_exit = 1_048_576
+            # Once nothing more is owed and no marker has come (a dead host, or
+            # a command that broke the console writer), a live background writer
+            # must not hold this command open. The byte budget exceeds the
+            # bounded reader/OS buffers left by the host; the wait budget counts
+            # only time spent waiting for data, never a slow consumer's time.
+            remaining_after_stop = 1_048_576
+            wait_budget = _MARKER_GRACE_S
             try:
                 while True:
                     reading = asyncio.create_task(stream.read(8192))
-                    await asyncio.wait((reading, exited), return_when=asyncio.FIRST_COMPLETED)
+                    if not stopping.is_set():
+                        await asyncio.wait((reading, stopped), return_when=asyncio.FIRST_COMPLETED)
                     try:
-                        data = (
-                            await asyncio.wait_for(reading, 0.1)
-                            if host_exited.is_set()
-                            else await reading
-                        )
+                        if stopping.is_set():
+                            grace = 0.1 if host_exited.is_set() else wait_budget
+                            waited_from = loop.time()
+                            data = await asyncio.wait_for(reading, max(grace, 0.0))
+                            wait_budget -= loop.time() - waited_from
+                        else:
+                            data = await reading
                     except (TimeoutError, OSError):
                         break
                     if not data:
@@ -528,6 +539,7 @@ class PowerShellSession:
                         if text := decoder.decode(pending[:end], final=True):
                             await queue.put((name, text))
                         pending = b""
+                        marked.add(name)
                         break
                     # Keep a possible split marker; the decoder keeps split UTF-8.
                     start = pending.rfind(marker[:1])
@@ -537,9 +549,9 @@ class PowerShellSession:
                     if text := decoder.decode(pending[:safe]):
                         await queue.put((name, text))
                     pending = pending[safe:]
-                    if host_exited.is_set():
-                        remaining_after_exit -= len(data)
-                        if remaining_after_exit <= 0:
+                    if stopping.is_set():
+                        remaining_after_stop -= len(data)
+                        if remaining_after_stop <= 0:
                             break
                 if text := decoder.decode(pending, final=True):
                     await queue.put((name, text))
@@ -547,11 +559,11 @@ class PowerShellSession:
             except Exception as error:
                 await queue.put(("__error__", error))
             finally:
-                exited.cancel()
+                stopped.cancel()
                 if reading is not None:
                     reading.cancel()
                     await asyncio.gather(reading, return_exceptions=True)
-                await asyncio.gather(exited, return_exceptions=True)
+                await asyncio.gather(stopped, return_exceptions=True)
 
         async def control() -> None:
             try:
@@ -572,11 +584,7 @@ class PowerShellSession:
                                 "PowerShell control response did not match the command"
                             )
                         result = _Completion(int(reply["code"]))
-                        # Registry/Env: and other providers report non-filesystem
-                        # locations; keep the last real directory instead.
-                        cwd = Path(reply.get("cwd") or "")
-                        if cwd.is_absolute():
-                            self._cwd = cwd
+                        self._adopt_cwd(reply.get("cwd"))
                         self._remember_background()
                     else:
                         # A socket reset can precede the process-exit callback.
@@ -585,11 +593,15 @@ class PowerShellSession:
                             await asyncio.sleep(0.01)
                         host_exited.set()
                         result = _Completion(proc.returncode)
+                # The command is over either way: its output is fully written,
+                # so a pipe still waiting for a marker must not wait forever.
+                stopping.set()
                 await queue.put(("__control__", result))
             except TimeoutError:
                 try:
                     await self._retire_current()
                     host_exited.set()
+                    stopping.set()
                     await queue.put(("__control__", _Completion(124, timed_out=True)))
                 except Exception as error:
                     await queue.put(("__error__", error))
@@ -618,7 +630,11 @@ class PowerShellSession:
                 else:
                     assert isinstance(value, str)
                     yield name, value
-            completed = not host_exited.is_set()
+            # A live host whose reply came without both markers has a console
+            # writer this protocol can no longer parse; reusing it would hang
+            # the next command the same way, so it is replaced like a timeout.
+            lost_marker = not host_exited.is_set() and marked != {"stdout", "stderr"}
+            completed = not host_exited.is_set() and not lost_marker
         finally:
             for task in tasks:
                 task.cancel()
@@ -628,7 +644,25 @@ class PowerShellSession:
             if input_path is not None:
                 input_path.unlink(missing_ok=True)
         assert result is not None
+        if lost_marker:
+            yield "stderr", _LOST_MARKER_NOTE
         yield "__done__", f"{result.code},{int(result.timed_out)}"
+
+    def _adopt_cwd(self, reported: object) -> None:
+        """Record the host's location only when it is a real directory.
+
+        The reply carries ``ProviderPath``, which for a non-filesystem location
+        (``HKLM:\\``, ``Env:``) is not a directory, and for the registry is even
+        relative (``HKEY_LOCAL_MACHINE\\...``). Recording it made every later
+        restart fail, because a new host is started in this directory, and sent
+        relative file-tool paths elsewhere. The last confirmed directory is
+        kept instead; the live host still runs where the command left it.
+        """
+        if not isinstance(reported, str) or not reported:
+            return
+        path = Path(reported)
+        if path.is_absolute() and path.is_dir():
+            self._cwd = path
 
     def _remember_background(self) -> None:
         assert self._job is not None and self._process is not None

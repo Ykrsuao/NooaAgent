@@ -170,21 +170,23 @@ jobs:
         # runtime root, so the package has to be installed here as well.
         run: uv sync --frozen --package nooa --package nooa-cli --no-dev --group test --extra cli
       - name: Cache the private runtime root
+        id: runtime-root-cache
         uses: actions/cache@v4
         with:
           # Keyed on the lockfile: the root is a copy of the resolved
           # interpreter and site-packages, so a dependency change invalidates it.
+          # No restore-keys: --sync refreshes only the workspace packages, so a
+          # root restored from an older lockfile kept its old third-party
+          # packages, and the job then saved that stale root under the new key.
           path: .sandbox-rt
           key: sandbox-rt-${{ runner.os }}-3.13-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            sandbox-rt-${{ runner.os }}-3.13-
       - name: Build or refresh the runtime root
         shell: pwsh
         run: |
           # Rebuilding unconditionally would cost ~4.5 min on every run and
           # make the cache useless. The package copy is always refreshed:
           # it is sub-second, and a stale copy would test the previous commit.
-          if (-not (Test-Path ".sandbox-rt/python.exe")) {
+          if ('${{ steps.runtime-root-cache.outputs.cache-hit }}' -ne 'true') {
             uv run --no-sync python -m nooa.runtime.sandbox.win_runtime --build --root .sandbox-rt
           } else {
             uv run --no-sync python -m nooa.runtime.sandbox.win_runtime --sync --root .sandbox-rt

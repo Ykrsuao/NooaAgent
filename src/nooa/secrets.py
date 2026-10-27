@@ -96,6 +96,20 @@ def names_loaded_from_file() -> frozenset[str]:
     return frozenset(_LOADED_FROM_FILE)
 
 
+def environment_without_loaded_secrets() -> dict[str, str]:
+    """A copy of ``os.environ`` without the names loaded from secrets.yaml.
+
+    The environment for a child the model can drive (an agent's shell). Names
+    the user exported stay: the shell is their tool and they asked for them.
+    Names :func:`load_secrets_into_env` added exist only to configure this
+    process's own LLM client, which read them before any child started; a
+    command that can print an env var can send it anywhere. Both shell
+    backends call this, so the rule cannot drift between them.
+    """
+    loaded = names_loaded_from_file()
+    return {key: value for key, value in os.environ.items() if key not in loaded}
+
+
 def write_secret_env(path, name: str, value: str) -> None:
     """Atomically save one credential with owner-only permissions.
 
@@ -148,4 +162,9 @@ def write_secret_env(path, name: str, value: str) -> None:
             temporary.unlink(missing_ok=True)
 
 
-__all__ = ["load_secrets_into_env", "names_loaded_from_file", "write_secret_env"]
+__all__ = [
+    "environment_without_loaded_secrets",
+    "load_secrets_into_env",
+    "names_loaded_from_file",
+    "write_secret_env",
+]

@@ -241,21 +241,32 @@ def _resolve_child_attr(broker: ChildBroker, local_obj: Any, path: list[str], na
     """
     new_path = [*path, name]
     if local_obj is None:
-        value, is_proxy, is_callable, is_async = broker.get_attr(new_path)
-        if is_proxy:
-            return _NestedProxy(broker, new_path, None)
-        if is_callable:
-            return _BrokerCallable(broker, new_path, is_async)
-        return value
+        return _from_parent(broker, new_path, None)
     try:
         local_attr = getattr(local_obj, name)
     except AttributeError:
-        value, is_proxy, _callable, _async = broker.get_attr(new_path)
-        return _NestedProxy(broker, new_path, None) if is_proxy else value
+        # The forked copy predates this attribute (a tool the parent added
+        # later). Only the parent knows what it is now.
+        return _from_parent(broker, new_path, None)
     if callable(local_attr) and not isinstance(local_attr, type):
         return _BrokerCallable(broker, new_path, _is_async_callable(local_attr))
-    value, is_proxy, _callable, _async = broker.get_attr(new_path)
-    return _NestedProxy(broker, new_path, local_attr) if is_proxy else value
+    # A value locally, but the parent may have rebound it to a callable since.
+    return _from_parent(broker, new_path, local_attr)
+
+
+def _from_parent(broker: ChildBroker, path: list[str], local_obj: Any) -> Any:
+    """Turn the parent's answer for ``self.<path>`` into what the cell gets.
+
+    The parent sends a callable as a flag with ``result=None`` (the callable
+    itself never crosses), so the flag must be honoured on every path. Reading
+    only ``proxy`` turned such an attribute into ``None`` in the cell.
+    """
+    value, is_proxy, is_callable, is_async = broker.get_attr(path)
+    if is_callable:
+        return _BrokerCallable(broker, path, is_async)
+    if is_proxy:
+        return _NestedProxy(broker, path, local_obj)
+    return value
 
 
 class _NestedProxy:
@@ -276,10 +287,7 @@ class _NestedProxy:
         if local is None:
             # Unknown local shape (spawned worker, or a non-picklable parent
             # object): let the parent classify callable vs value.
-            value, is_proxy, is_callable, is_async = broker.get_attr([*path, name])
-            if is_callable:
-                return _BrokerCallable(broker, [*path, name], is_async)
-            return _NestedProxy(broker, [*path, name], None) if is_proxy else value
+            return _from_parent(broker, [*path, name], None)
         return _resolve_child_attr(broker, local, path, name)
 
     def __setattr__(self, name: str, value: Any) -> None:

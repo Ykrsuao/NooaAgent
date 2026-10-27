@@ -106,6 +106,22 @@ class WorkerBlueprint:
             call_meta=shim,
         )
 
+    def require_named_module(self) -> None:
+        """Refuse an agent class that only exists in the parent's ``__main__``.
+
+        multiprocessing's ``spawn`` re-runs the main script in its child as
+        ``__mp_main__``, so ``import __main__`` there finds the class. The
+        Windows AppContainer worker starts as ``python -m ...win_worker``: its
+        ``__main__`` is that module, and the lookup failed later with a bare
+        "cannot resolve" error. Say what is wrong while it is still fixable.
+        """
+        if self.agent_module == "__main__":
+            raise BlueprintError(
+                f"agent class {self.agent_qualname!r} is defined in the script being run "
+                "(__main__); the Windows sandbox worker cannot import it from there. Move "
+                "the class into a module and import it from your script."
+            )
+
     # --- rebuild (runs in the child) ---------------------------------------
     def import_agent_class(self) -> type:
         """Import the agent class by name, with a diagnostic on failure."""
